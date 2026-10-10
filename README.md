@@ -285,3 +285,5 @@ make this better for everyone.
 
 Apache-2.0. See [`LICENSE`](LICENSE).
 Use it, fork it, vendor it, sell services on top of it.
+
+<!-- prueba de integración: ejercita la subida a code scanning y el comentario del pull request -->
