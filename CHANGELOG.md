@@ -5,6 +5,68 @@ built-ins and two files — so the SHA is the entire trust boundary.
 
 ---
 
+## v1.2.0
+
+One mechanism, and it is a different kind of thing from everything else in this action.
+
+### A badge, because asking to be listed cannot bootstrap itself
+
+Every other output of this action lives inside the adopter's pipeline: the CBOM, the SARIF, the
+report, the pull-request comment. All useful to them, all invisible to everyone else. That left
+propagation with exactly one mechanism — go to curated lists, registries and marketplaces and ask a
+human to admit us — and that mechanism cannot start itself. Not as a theory: on the day v1.0.0 was
+published, two curated lists declined it in almost the same words, saying there was not yet
+"sufficient evidence of independent adoption" and that they would reconsider if it appeared. You
+need adopters to get listings and listings to get adopters.
+
+A badge inverts who propagates. It stops being something we ask for and becomes something the
+adopter wants to display, and their README becomes the listing. It is the dynamic that spread test
+coverage badges.
+
+```yaml
+      - uses: johnInarti/pqc-readiness-action@v1
+        with:
+          baseline: .github/pqc-baseline.json
+          badge: pqc-badge.json
+```
+
+**It renders from the adopter's repository, not from a server of ours.** The action writes a
+shields.io endpoint file into their tree and shields.io reads it from their raw URL. Nothing about
+their code, their counts or their repository reaches us. A badge server of our own would have been
+easier to build and would have broken the one promise that makes this adoptable inside a bank.
+
+**The decision that determines whether it works at all:** the message and the colour reward
+movement rather than grading the starting position. With a baseline it reads `3 families · holding`,
+`3 families · −12 vs baseline`, or `4 families · +1 vs baseline`. Without one it reads
+`3 families inventoried`, in neutral. It is never red and never calls a repository vulnerable or
+insecure — not out of politeness: a repository with eight hundred occurrences did not choose to
+start there, and a badge that shames it on day one never gets added to a README, so it would
+communicate nothing to anyone. A regression shows amber, because going up is a signal for the team,
+not a public infraction. Four regression tests hold this, including one that fails if the badge ever
+renders red or accusatory on a first scan.
+
+If the scan could not read everything the badge also says `partial scan`. A green badge over a
+truncated scan would be the most dishonest thing this tool could produce.
+
+### Fixed: a truncation alarm that was going off on every normal run
+
+Deliberate exclusions — this action's own outputs, and any existing CycloneDX, SARIF or baseline
+document — were being counted as lost coverage, so a perfectly complete scan of a repository that
+commits its CBOM, which this README recommends, reported "COVERAGE WAS TRUNCATED" and the badge
+said `partial scan`. An alarm that sounds every time stops being an alarm: by the third run nobody
+reads it, which is exactly the run where it matters.
+
+The two are now separate. Lost coverage of your code shouts, annotates the run and marks the badge.
+A deliberate exclusion is precision, not a gap: it is printed quietly, recorded in the CBOM so the
+document can still be audited, and reported in the written report under a heading that says so. It
+is not an alarm, and it is not a secret either.
+
+### Tests
+
+61 regression checks, up from 55.
+
+---
+
 ## v1.1.0
 
 Three things this release adds, and one real detection bug it fixes.

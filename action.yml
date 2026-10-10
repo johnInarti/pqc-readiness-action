@@ -58,6 +58,16 @@ inputs:
     required: false
     default: ''
 
+  badge:
+    description: >-
+      Where to write a shields.io endpoint JSON so you can put a post-quantum badge in your README.
+      It renders from YOUR repository, not from a server of ours, so nothing about your code reaches
+      us. The message rewards movement rather than grading where you started: with a baseline it
+      says whether the inventory is going down, holding or up, which is the part your team controls.
+      Empty to skip.
+    required: false
+    default: ''
+
   fail-on-findings:
     description: >-
       Fail the job if any quantum-vulnerable cryptography is found at all. Honest but unusable on a
@@ -124,6 +134,7 @@ runs:
         PQC_OUTPUT: ${{ inputs.output }}
         PQC_SARIF: ${{ inputs.sarif }}
         PQC_REPORT: ${{ inputs.report }}
+        PQC_BADGE: ${{ inputs.badge }}
         PQC_BASELINE: ${{ inputs.baseline }}
         PQC_WRITE_BASELINE: ${{ inputs.write-baseline }}
         PQC_FAIL_ON_INCREASE: ${{ inputs.fail-on-increase }}

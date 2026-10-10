@@ -44,6 +44,7 @@ const FAIL = input('PQC_FAIL_ON_FINDINGS', 'fail-on-findings', 'false') === 'tru
 const SEAL = input('PQC_SEAL', 'seal', 'false') === 'true';
 const SARIF_RAW = input('PQC_SARIF', 'sarif', '');
 const REPORT_RAW = input('PQC_REPORT', 'report', '');
+const BADGE_RAW = input('PQC_BADGE', 'badge', '');
 const BASELINE_RAW = input('PQC_BASELINE', 'baseline', '');
 const FAIL_ON_INCREASE = input('PQC_FAIL_ON_INCREASE', 'fail-on-increase', 'false') === 'true';
 const WRITE_BASELINE = input('PQC_WRITE_BASELINE', 'write-baseline', 'false') === 'true';
@@ -54,7 +55,7 @@ const WRITE_BASELINE = input('PQC_WRITE_BASELINE', 'write-baseline', 'false') ==
  * el log no lo decía. Ahora solo se acepta https y SIEMPRE se imprime el destino antes de enviar.
  */
 /** Una sola fuente de verdad: el CBOM y el SARIF deben declarar la MISMA version. */
-const TOOL_VERSION = '1.1.0';
+const TOOL_VERSION = '1.2.0';
 
 const DEFAULT_API = 'https://fractalai.net.co';
 let API = DEFAULT_API;
@@ -114,6 +115,7 @@ const OUT = safeOutPath(OUT_RAW);
 // puerta trasera al mismo agujero de escritura arbitraria que ya se cerro para la primera.
 const SARIF_OUT = SARIF_RAW ? safeOutPath(SARIF_RAW) : null;
 const REPORT_OUT = REPORT_RAW ? safeOutPath(REPORT_RAW) : null;
+const BADGE_OUT = BADGE_RAW ? safeOutPath(BADGE_RAW) : null;
 const BASELINE_PATH = BASELINE_RAW ? safeOutPath(BASELINE_RAW) : null;
 // Lo que se escribe es la ruta absoluta ya validada; lo que se PUBLICA como salida del paso y se
 // imprime es la que pidió quien nos llama, porque es la que su propio workflow sabe consumir
@@ -339,7 +341,7 @@ const skipped = { fileCap: false, depthCap: 0, tooBig: 0, unreadable: 0, skipped
   longLines: 0, notUtf8: 0, deadline: false, byteBudget: false, ownOutput: 0, inventoryDoc: 0 };
 
 /** Rutas que este propio pase escribe. Se saltan siempre, pase lo que pase. */
-const OWN_OUTPUTS = new Set([OUT, SARIF_OUT, BASELINE_PATH, REPORT_OUT].filter(Boolean).map((x) => path.resolve(x)));
+const OWN_OUTPUTS = new Set([OUT, SARIF_OUT, BASELINE_PATH, REPORT_OUT, BADGE_OUT].filter(Boolean).map((x) => path.resolve(x)));
 /** Un documento que ES un inventario (CycloneDX o SARIF), venga de nosotros o de otra herramienta. */
 // Se reconoce por CONTENIDO y no por nombre a proposito: un archivo de linea base renombrado, o
 // copiado a otra carpeta, seguia envenenando el barrido porque lleva dentro los identificadores de
@@ -517,18 +519,34 @@ const assetBase = (def) => ({
   ...(def.oid ? { oid: def.oid } : {}),
 });
 
-const coverageNotes = [];
-if (skipped.fileCap) coverageNotes.push(`the ${MAX_FILES}-file cap was reached, so the scan is INCOMPLETE`);
-if (skipped.depthCap) coverageNotes.push(`${skipped.depthCap} directory branch(es) deeper than ${MAX_DEPTH} levels were not entered`);
-if (skipped.tooBig) coverageNotes.push(`${skipped.tooBig} file(s) over ${MAX_BYTES} bytes were skipped`);
-if (skipped.longLines) coverageNotes.push(`${skipped.longLines} line(s) over ${MAX_LINE} characters were not matched`);
-if (skipped.notUtf8) coverageNotes.push(`${skipped.notUtf8} file(s) were not UTF-8 text and were not matched`);
-if (skipped.ownOutput) coverageNotes.push(`${skipped.ownOutput} of this scan's own output file(s) were excluded on purpose`);
-if (skipped.inventoryDoc) coverageNotes.push(`${skipped.inventoryDoc} existing CBOM/SARIF inventory document(s) were excluded on purpose: their algorithm names are report metadata, not call sites`);
-if (skipped.deadline) coverageNotes.push(`the ${DEADLINE_MS}ms deadline was reached, so the scan is INCOMPLETE (raise PQC_TIMEOUT_MS)`);
-if (skipped.byteBudget) coverageNotes.push(`the ${MAX_TOTAL_BYTES}-byte total budget was reached, so the scan is INCOMPLETE`);
-if (skipped.unreadable) coverageNotes.push(`${skipped.unreadable} path(s) could not be read`);
-if (skipped.skippedDirs.size) coverageNotes.push(`these directory names were skipped by default and may contain cryptography: ${[...skipped.skippedDirs].sort().join(', ')}`);
+const truncationNotes = [];
+if (skipped.fileCap) truncationNotes.push(`the ${MAX_FILES}-file cap was reached, so the scan is INCOMPLETE`);
+if (skipped.depthCap) truncationNotes.push(`${skipped.depthCap} directory branch(es) deeper than ${MAX_DEPTH} levels were not entered`);
+if (skipped.tooBig) truncationNotes.push(`${skipped.tooBig} file(s) over ${MAX_BYTES} bytes were skipped`);
+if (skipped.longLines) truncationNotes.push(`${skipped.longLines} line(s) over ${MAX_LINE} characters were not matched`);
+if (skipped.notUtf8) truncationNotes.push(`${skipped.notUtf8} file(s) were not UTF-8 text and were not matched`);
+/**
+ * Dos listas, y la diferencia importa.
+ *
+ * `truncationNotes` es cobertura PERDIDA de su codigo: un archivo demasiado grande, uno que no es
+ * UTF-8, un tope alcanzado. Eso degrada el resultado y tiene que gritarlo, porque un barrido
+ * truncado leido como limpio es la peor cosa que puede hacer esta herramienta.
+ *
+ * `deliberateNotes` es lo que excluimos A PROPOSITO: nuestras propias salidas y cualquier documento
+ * que YA es un inventario. Eso no es menos cobertura de su codigo, es precision. Meterlo en el mismo
+ * saco hacia que cada corrida normal dijera «barrido parcial», y una alarma que suena siempre deja
+ * de ser una alarma: a la tercera vez nadie la mira, justo el dia en que es verdad.
+ */
+const deliberateNotes = [];
+if (skipped.ownOutput) deliberateNotes.push(`${skipped.ownOutput} of this scan's own output file(s) were excluded on purpose`);
+if (skipped.inventoryDoc) deliberateNotes.push(`${skipped.inventoryDoc} existing CBOM/SARIF inventory document(s) were excluded on purpose: their algorithm names are report metadata, not call sites`);
+if (skipped.deadline) truncationNotes.push(`the ${DEADLINE_MS}ms deadline was reached, so the scan is INCOMPLETE (raise PQC_TIMEOUT_MS)`);
+if (skipped.byteBudget) truncationNotes.push(`the ${MAX_TOTAL_BYTES}-byte total budget was reached, so the scan is INCOMPLETE`);
+if (skipped.unreadable) truncationNotes.push(`${skipped.unreadable} path(s) could not be read`);
+if (skipped.skippedDirs.size) truncationNotes.push(`these directory names were skipped by default and may contain cryptography: ${[...skipped.skippedDirs].sort().join(', ')}`);
+
+/** El documento lo cuenta TODO: quien reciba el archivo sin ver el log debe poder auditar ambas. */
+const coverageNotes = [...truncationNotes, ...deliberateNotes];
 
 const cbom = {
   $schema: 'http://cyclonedx.org/schema/bom-1.6.schema.json',
@@ -726,12 +744,19 @@ function buildReport() {
   L.push('This is a **static scan** of manifests and source text. It is evidence to start a migration from.', '');
   L.push('It is **not a proof of absence.** It cannot see cryptography reached through dynamic loading, compiled into vendored binaries, or performed inside a hardware security module. Zero findings in a family means nothing matched, not that nothing is there.', '');
   L.push('It is **not a compliance certification**, and no auditor should accept it as one.', '');
-  if (coverageNotes.length) {
+  if (truncationNotes.length) {
     L.push('### This particular scan did not read everything', '');
-    for (const n of coverageNotes) L.push(`- ${n}`);
+    for (const n of truncationNotes) L.push(`- ${n}`);
     L.push('', 'Any conclusion below is bounded by that list.', '');
   } else {
     L.push('No cap was hit on this run: every file matching the scan rules under the scanned path was read.', '');
+  }
+  if (deliberateNotes.length) {
+    // Separado de la truncacion a proposito: esto no es cobertura perdida de su codigo, es
+    // precision. Mezclarlo haria que cada informe normal dijera «no lo leimos todo».
+    L.push('### Excluded on purpose, which is not the same as missed', '');
+    for (const n of deliberateNotes) L.push(`- ${n}`);
+    L.push('', 'An existing inventory document lists algorithm names by definition. Reading one back would inflate these counts with our own report rather than with your code.', '');
   }
 
   L.push('## The deadline', '');
@@ -882,6 +907,83 @@ if (REPORT_OUT) {
   fs.writeFileSync(REPORT_OUT, buildReport());
 }
 
+/**
+ * La insignia, y por que no es una funcion mas.
+ *
+ * Todo lo demas de esta accion vive dentro del pase de quien la adopta: el CBOM, el SARIF, el
+ * informe, el comentario. Son utiles para el, y completamente invisibles para cualquier otro. Eso
+ * deja la propagacion en manos de un unico mecanismo: ir a listas, registros y mercados y pedir que
+ * un humano nos admita. Y ese mecanismo no se puede arrancar solo, lo que no es una teoria: dos
+ * listas curadas nos rechazaron el mismo dia diciendo literalmente que falta «evidencia de adopcion
+ * independiente». Hacen falta adoptantes para conseguir listados y listados para conseguir
+ * adoptantes.
+ *
+ * Una insignia rompe ese circulo porque invierte quien propaga. Deja de ser algo que pedimos y pasa
+ * a ser algo que el adoptante QUIERE exhibir, y su README se convierte en el listado. Es la
+ * dinamica que extendio las insignias de cobertura de pruebas.
+ *
+ * Y se renderiza desde el repositorio DEL ADOPTANTE, no desde un servidor nuestro: escribimos un
+ * JSON en su arbol, el lo publica, y shields.io lo lee de su URL. Nosotros no recibimos ni un byte.
+ * Un servidor de insignias nuestro habria sido mas facil y habria roto la unica promesa que hace
+ * adoptable esta herramienta en banca y gobierno, que es que nada sale de su runner.
+ *
+ * La decision que decide si esto funciona: el MENSAJE Y EL COLOR premian el avance, no califican el
+ * punto de partida. Un repositorio con ochocientas ocurrencias no eligio empezar ahi, y una
+ * insignia que lo pinta de rojo el primer dia no la pone nadie en su README; entonces no propaga
+ * nada y el mecanismo entero no sirve. Con linea base la insignia dice si el inventario BAJA, se
+ * MANTIENE o SUBE, que es lo unico que el equipo controla. Sin linea base dice el recuento en
+ * neutro, sin emitir juicio, porque calificar una foto del pasado no es informacion, es un reproche.
+ */
+function buildBadge() {
+  const families = codeFamilies;
+  let message;
+  let color;
+
+  if (baselineReport) {
+    const up = baselineReport.worse.length;
+    const down = baselineReport.better.length;
+    const net = baselineReport.better.reduce((n, b) => n + (b.from - b.to), 0)
+      - baselineReport.worse.reduce((n, w) => n + (w.to - w.from), 0);
+    if (up > 0) {
+      // Ambar y no rojo: una subida es una señal para el equipo, no una infracción pública. El rojo
+      // invita a quitar la insignia; el ámbar invita a mirar el pase.
+      message = `${families} famil${families === 1 ? 'y' : 'ies'} · +${up} vs baseline`;
+      color = 'orange';
+    } else if (down > 0) {
+      message = `${families} famil${families === 1 ? 'y' : 'ies'} · −${net} vs baseline`;
+      color = 'brightgreen';
+    } else {
+      message = `${families} famil${families === 1 ? 'y' : 'ies'} · holding`;
+      color = 'blue';
+    }
+  } else {
+    message = families === 0 ? 'nothing matched' : `${families} famil${families === 1 ? 'y' : 'ies'} inventoried`;
+    color = 'blue';
+  }
+
+  // Solo la cobertura REDUCIDA DE SU CODIGO degrada la insignia. Excluir a proposito nuestros
+  // propios artefactos no es menos cobertura de lo suyo, y marcarlo como «parcial» en cada corrida
+  // normal seria gritar que viene el lobo: a la tercera vez nadie mira el aviso cuando es verdad.
+  if (truncationNotes.length) message += ' · partial scan';
+
+  // Esquema de endpoint de shields.io. `isError` se queda en falso a proposito: esto es un
+  // inventario, no un fallo, y pintarlo como error seria la version en insignia del mismo error que
+  // habria sido emitir los hallazgos de SARIF con nivel `error`.
+  return {
+    schemaVersion: 1,
+    label: 'post-quantum',
+    message,
+    color,
+    namedLogo: 'shield',
+    isError: false,
+  };
+}
+
+if (BADGE_OUT) {
+  fs.mkdirSync(path.dirname(BADGE_OUT), { recursive: true });
+  fs.writeFileSync(BADGE_OUT, JSON.stringify(buildBadge(), null, 2) + '\n');
+}
+
 // ── Report (this is what a human reads in the CI log) ──
 const red = (s) => `\x1b[31m${s}\x1b[0m`;
 const grn = (s) => `\x1b[32m${s}\x1b[0m`;
@@ -890,17 +992,26 @@ console.log('');
 console.log('  PQC Readiness Scan — quantum-vulnerable cryptography in this repository');
 console.log(dim(`  ${files.length} files scanned · CycloneDX CBOM written to ${clean(OUT_LABEL)}`));
 console.log('');
-if (coverageNotes.length) {
+// La exclusion deliberada se dice en voz BAJA, pero se dice. Al separarla de la alarma deje de
+// imprimirse del todo, y entonces alguien que commitea su CBOM no tendria forma de saber por que no
+// se escaneo: parecia que la herramienta se lo habia tragado. Que no sea una alarma no significa que
+// sea un secreto.
+if (deliberateNotes.length) {
+  for (const n of deliberateNotes) console.log(dim(`  ${n}`));
+  console.log('');
+}
+
+if (truncationNotes.length) {
   console.log(red('  ⚠ COVERAGE WAS TRUNCATED — this scan did not read everything:'));
-  for (const n of coverageNotes) console.log(red(`      · ${n}`));
+  for (const n of truncationNotes) console.log(red(`      · ${n}`));
   console.log('');
   // En GitHub esto sale como anotación en la página del pase, no solo en el log, para que nadie
   // archive un informe truncado creyéndolo completo.
-  if (process.env.GITHUB_ACTIONS) console.log(`::warning title=PQC scan coverage truncated::${coverageNotes.join('; ')}`);
+  if (process.env.GITHUB_ACTIONS) console.log(`::warning title=PQC scan coverage truncated::${truncationNotes.join('; ')}`);
 }
 
 if (codeFamilies === 0) {
-  console.log(coverageNotes.length
+  console.log(truncationNotes.length
     ? red('  No quantum-vulnerable primitives matched IN WHAT WAS SCANNED. See the truncation above:')
     : grn('  No quantum-vulnerable primitives matched.'));
   console.log(dim('  That is not a proof of absence: a static scan misses dynamic loading, vendored'));
@@ -1054,7 +1165,7 @@ if (gh) {
     `cbom<<${delim}`, OUT_LABEL, delim,
     `increased=${increased}`,
     `decreased=${decreased}`,
-    `truncated=${coverageNotes.length ? 'true' : 'false'}`,
+    `truncated=${truncationNotes.length ? 'true' : 'false'}`,
   ];
   if (SARIF_OUT) { const d2 = 'PQC_EOF_' + crypto.randomBytes(16).toString('hex'); lines.push(`sarif<<${d2}`, SARIF_RAW, d2); }
   fs.appendFileSync(gh, lines.join('\n') + '\n');

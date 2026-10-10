@@ -669,6 +669,100 @@ check('every optional step guards itself, since composite steps cannot continue-
   assert(/\|\|\s*echo/.test(runsBlock), 'the pull-request comment step is not guarded with ||');
 });
 
+// ─────────── La insignia: el unico artefacto que propaga sin pedirle permiso a nadie ───────────
+const badge = (name) => JSON.parse(fs.readFileSync(path.join(WORK, name), 'utf8'));
+
+check('writes a shields.io endpoint badge, in English and renderable', () => {
+  const d = fixture('badge1', { 'a.js': 'const s = crypto.createSign("RSA-SHA256");\n' });
+  const r = run([`--path=${d}`, '--output=bg.json', '--badge=bg-badge.json', '--sarif=']);
+  assert(r.code === 0, `exit ${r.code}`);
+  const b = badge('bg-badge.json');
+  assert(b.schemaVersion === 1, 'shields.io requires schemaVersion 1');
+  assert(b.label === 'post-quantum', `label ${b.label}`);
+  assert(typeof b.message === 'string' && b.message.length > 0, 'no message');
+  assert(typeof b.color === 'string', 'no color');
+  // Un `isError` verdadero pinta la insignia como fallo. Esto es un inventario, y pintarlo como
+  // error seria la version en insignia del mismo error que habria sido emitir SARIF con nivel error.
+  assert(b.isError === false, 'the badge must not render as an error');
+  // La salida al usuario va en ingles: la lee todo el mundo, no solo nosotros.
+  assert(!/famili[ae]|ninguna|mantiene|desde la base|barrido/.test(b.message), `the badge message is not in English: ${b.message}`);
+});
+
+// La decision que decide si esto propaga algo. Un repositorio con cientos de ocurrencias no eligio
+// empezar ahi, y una insignia que lo pinta de rojo el primer dia no la pone nadie en su README;
+// entonces no propaga nada y el mecanismo entero no sirve.
+check('the badge never shames a repository for where it started', () => {
+  const d = fixture('badge2', { 'a.js': 'const k = "RSA";\nconst j = "ECDSA";\nconst x = "X25519";\nconst e = "Ed25519";\nconst dd = "DSA";\n' });
+  run([`--path=${d}`, '--output=bg2.json', '--badge=bg2-badge.json', '--sarif=']);
+  const b = badge('bg2-badge.json');
+  assert(b.color !== 'red', 'a first-day scan must not render red');
+  assert(!/critical|fail|danger|bad/i.test(b.color), `alarming colour on a first scan: ${b.color}`);
+  assert(!/vulnerable|insecure|unsafe|risk/i.test(b.message), `accusatory wording: ${b.message}`);
+});
+
+check('the badge rewards movement: holding, down and up each read differently', () => {
+  const d = fixture('badge3', { 'a.js': 'const s = crypto.createSign("RSA-SHA256");\nconst k = "X25519";\n' });
+  run([`--path=${d}`, '--output=b3.json', '--badge=b3-badge.json', '--baseline=b3-bl.json', '--write-baseline=true', '--sarif=']);
+
+  run([`--path=${d}`, '--output=b3.json', '--badge=b3-badge.json', '--baseline=b3-bl.json', '--sarif=']);
+  const holding = badge('b3-badge.json');
+  assert(/holding/.test(holding.message), `unchanged should read as holding: ${holding.message}`);
+  assert(holding.color === 'blue', `unchanged colour ${holding.color}`);
+
+  fs.writeFileSync(path.join(WORK, d, 'a.js'), 'const x = 1;\n');
+  run([`--path=${d}`, '--output=b3.json', '--badge=b3-badge.json', '--baseline=b3-bl.json', '--sarif=']);
+  const better = badge('b3-badge.json');
+  assert(/−|-\d/.test(better.message), `improvement should be visible: ${better.message}`);
+  assert(better.color === 'brightgreen', `improvement colour ${better.color}`);
+
+  fs.writeFileSync(path.join(WORK, d, 'a.js'), 'const s = crypto.createSign("RSA-SHA256");\nconst k = "X25519";\nconst n = crypto.createECDH("prime256v1");\n');
+  run([`--path=${d}`, '--output=b3.json', '--badge=b3-badge.json', '--baseline=b3-bl.json', '--sarif=']);
+  const worse = badge('b3-badge.json');
+  assert(/\+\d/.test(worse.message), `a regression should be visible: ${worse.message}`);
+  // Ambar y no rojo: una subida es una señal para el equipo, no una infraccion publica. El rojo
+  // invita a quitar la insignia, y entonces se pierde la señal entera.
+  assert(worse.color === 'orange', `a regression should be amber, not ${worse.color}`);
+});
+
+check('nothing about the adopter reaches us: the badge is a local file', () => {
+  const d = fixture('badge4', { 'a.js': 'const s = crypto.createSign("RSA-SHA256");\n' });
+  run([`--path=${d}`, '--output=b4.json', '--badge=b4-badge.json', '--sarif=']);
+  const raw = fs.readFileSync(path.join(WORK, 'b4-badge.json'), 'utf8');
+  // Un servidor de insignias nuestro habria sido mas facil y habria roto la unica promesa que hace
+  // adoptable esto en banca: que nada sale de su runner. La insignia se renderiza desde SU repo.
+  assert(!/fractalai\.net\.co|api\./.test(raw), `the badge points at a server of ours: ${raw}`);
+  assert(!raw.includes(d), 'the badge leaks a path from the scanned repository');
+});
+
+// ───────── Truncacion REAL contra exclusion deliberada: una alarma que suena siempre no es alarma ─────────
+check('excluding our own artefacts does not count as lost coverage', () => {
+  const d = fixture('excl', { 'a.js': 'const s = crypto.createSign("RSA-SHA256");\n' });
+  // Un CBOM y una linea base ya presentes, que es el estado NORMAL de un repositorio que nos usa.
+  fs.writeFileSync(path.join(WORK, d, 'cbom.json'), JSON.stringify({ bomFormat: 'CycloneDX', specVersion: '1.6', components: [] }));
+  fs.writeFileSync(path.join(WORK, d, 'pqc-baseline.json'), JSON.stringify({ tool: 'pqc-readiness-scan', counts: { rsa: 1 } }));
+  const r = run([`--path=${d}`, '--output=ex.json', '--badge=ex-badge.json', '--report=ex.md', '--sarif=']);
+  // Si cada corrida normal grita «truncado», a la tercera vez nadie mira el aviso, justo el dia en
+  // que es verdad. La alarma se reserva para la cobertura perdida de SU codigo.
+  assert(!/COVERAGE WAS TRUNCATED/.test(r.out), 'a normal run cried wolf about truncation');
+  assert(!/partial scan/.test(fs.readFileSync(path.join(WORK, 'ex-badge.json'), 'utf8')), 'the badge said partial scan on a normal run');
+  const md = fs.readFileSync(path.join(WORK, 'ex.md'), 'utf8');
+  assert(/Excluded on purpose/.test(md), 'the deliberate exclusion was hidden instead of reported');
+  assert(!/did not read everything/.test(md), 'a normal run claimed it had not read everything');
+  // Pero sigue CONTANDO en el documento: quien reciba el CBOM debe poder auditar ambas cosas.
+  const limits = cbom('ex.json').metadata.properties.find((p) => p.name === 'fractalai:coverage_limits').value;
+  assert(/excluded on purpose/.test(limits), 'the CBOM hid the deliberate exclusion');
+});
+
+check('real truncation still shouts, and marks the badge and the output', () => {
+  const d = fixture('trunc2', { 'big.js': 'const k = crypto.createSign("RSA-SHA256");\n'.repeat(60000), 'ok.js': 'const x = "ECDSA";\n' });
+  const go = path.join(WORK, 'go-tr.txt');
+  fs.writeFileSync(go, '');
+  const r = run([`--path=${d}`, '--output=tr.json', '--badge=tr-badge.json', '--sarif='], { GITHUB_OUTPUT: go });
+  assert(/COVERAGE WAS TRUNCATED/.test(r.out), 'real truncation was silent');
+  assert(/partial scan/.test(fs.readFileSync(path.join(WORK, 'tr-badge.json'), 'utf8')), 'the badge hid real truncation');
+  assert(/truncated=true/.test(fs.readFileSync(go, 'utf8')), 'the truncated output was not set');
+});
+
 // ───────────────────────────── Result ─────────────────────────────
 fs.rmSync(WORK, { recursive: true, force: true });
 console.log('');

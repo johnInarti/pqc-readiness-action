@@ -138,6 +138,39 @@ that is rewritten rather than duplicated on every push, and a committed Markdown
 with a message naming the exact permission that was missing, and the scan still succeeds. A tool
 that fails someone else's build over a permission they did not know about deserves to be uninstalled.
 
+## A badge that rewards moving, not a grade for where you started
+
+```markdown
+[![post-quantum](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/OWNER/REPO/main/pqc-badge.json)](https://github.com/johnInarti/pqc-readiness-action)
+```
+
+```yaml
+      - uses: johnInarti/pqc-readiness-action@v1
+        with:
+          baseline: .github/pqc-baseline.json
+          badge: pqc-badge.json
+```
+
+Then commit `pqc-badge.json` the way you already commit any generated artefact.
+
+**It renders from your repository, not from a server of ours.** The action writes a shields.io
+endpoint file into your tree; shields.io reads it from your raw URL. Nothing about your code, your
+counts or your repository reaches us, which keeps the one promise that makes this adoptable inside
+a bank. A badge server of our own would have been easier to build and would have broken it.
+
+**What it says, and what it refuses to say.** With a baseline it reads `3 families · holding`,
+`3 families · −12 vs baseline`, or `4 families · +1 vs baseline`. Without one it reads
+`3 families inventoried`, in neutral, passing no judgement.
+
+It is never red, and it never calls your repository vulnerable or insecure. Not out of politeness:
+a repository with eight hundred occurrences did not choose to start there, and a badge that shames
+it on day one does not get added to a README — so it would communicate nothing to anyone. A
+regression shows amber, because going up is a signal for your team, not a public infraction. What
+the badge grades is the only thing a team actually controls, which is the direction.
+
+If the scan could not read everything, the badge says `partial scan` as well. A green badge over a
+truncated scan would be the most dishonest thing this tool could produce.
+
 ## Usage
 
 ```yaml
@@ -169,6 +202,7 @@ jobs:
 | `write-baseline` | `false` | Write or overwrite the baseline from this run. Do it deliberately. |
 | `fail-on-increase` | `false` | Fail only when a family goes up against the baseline. Requires `baseline`. |
 | `report` | — | Where to write the human-readable Markdown report. |
+| `badge` | — | Where to write the shields.io endpoint JSON for a README badge. |
 | `comment-on-pr` | `false` | Keep one comment updated on the pull request. Needs `pull-requests: write`. |
 | `fail-on-findings` | `false` | Fail if anything vulnerable is found at all. Honest but unusable on day one; prefer `fail-on-increase`. |
 | `seal` | `false` | Preview, not yet usable. See below. |

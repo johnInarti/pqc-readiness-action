@@ -18,7 +18,7 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: read
+  contents: write          # para commitear nuestra propia insignia
   security-events: write
 
 jobs:
@@ -35,6 +35,7 @@ jobs:
           sarif: pqc.sarif
           upload-sarif: 'true'
           report: PQC-REPORT.md
+          badge: pqc-badge.json
 
       - name: Guardar el inventario como artefacto
         uses: actions/upload-artifact@v4
@@ -44,7 +45,22 @@ jobs:
             cbom.json
             pqc.sarif
             PQC-REPORT.md
+            pqc-badge.json
           retention-days: 90
+
+      # Nuestra propia insignia, commiteada. Si no la exhibimos nosotros no tenemos derecho a
+      # pedirle a nadie que la exhiba, y de paso el README demuestra el mecanismo funcionando en vez
+      # de describirlo.
+      - name: Commitear la insignia si cambió
+        shell: bash
+        run: |
+          set -uo pipefail
+          git config user.name "pqc-self-scan"
+          git config user.email "noreply@fractalai.net.co"
+          git add pqc-badge.json 2>/dev/null || true
+          git diff --cached --quiet && { echo "la insignia no cambió"; exit 0; }
+          git commit -q -m "self-scan: actualizar la insignia post-cuántica [skip ci]"
+          git push -q origin HEAD:main && echo "insignia actualizada" || echo "::warning::no se pudo empujar la insignia; el barrido sí se hizo"
 
       - name: Nuestro propio inventario, en el resumen del pase
         shell: bash
