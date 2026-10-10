@@ -1,8 +1,8 @@
 # Post-quantum readiness inventory
 
-Generated 2026-10-10T17:56:32.435Z by [PQC Readiness Scan](https://github.com/johnInarti/pqc-readiness-action) 1.2.0.
+Generated 2026-10-10T17:56:59.843Z by [PQC Readiness Scan](https://github.com/johnInarti/pqc-readiness-action) 1.2.0.
 
-**12 files read. 104 occurrence(s) of quantum-vulnerable cryptography in code, across 8 algorithm family(ies).**
+**13 files read. 104 occurrence(s) of quantum-vulnerable cryptography in code, across 8 algorithm family(ies).**
 
 ## What this is, and what it is not
 
@@ -20,7 +20,7 @@ Any conclusion below is bounded by that list.
 
 ### Excluded on purpose, which is not the same as missed
 
-- 2 of this scan's own output file(s) were excluded on purpose
+- 3 of this scan's own output file(s) were excluded on purpose
 
 An existing inventory document lists algorithm names by definition. Reading one back would inflate these counts with our own report rather than with your code.
 
