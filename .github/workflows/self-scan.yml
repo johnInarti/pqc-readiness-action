@@ -1,0 +1,57 @@
+name: self-scan
+
+# La acción, corrida sobre su propio repositorio.
+#
+# Dos razones, y ninguna es decorativa. La primera es que si no nos la aplicamos a nosotros no
+# tenemos derecho a vendérsela a nadie: este repositorio tiene su propia criptografía clásica en los
+# ejemplos de prueba y debe aparecer en el inventario como la de cualquiera. La segunda es que así
+# la pestaña de seguridad de este repositorio muestra datos REALES, de modo que quien venga a
+# evaluar la herramienta puede ver el resultado antes de instalarla, en vez de creerse una captura.
+#
+# Se usa `./` y no la referencia publicada a propósito: el barrido debe reflejar el código de esta
+# rama, no el de la última etiqueta.
+
+on:
+  push: { branches: [main] }
+  schedule:
+    - cron: '17 6 * * 1'   # lunes, para que el inventario no envejezca en silencio
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  self:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: pqc
+        uses: ./
+        with:
+          path: .
+          output: cbom.json
+          sarif: pqc.sarif
+          upload-sarif: 'true'
+          report: PQC-REPORT.md
+
+      - name: Guardar el inventario como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: pqc-inventory
+          path: |
+            cbom.json
+            pqc.sarif
+            PQC-REPORT.md
+          retention-days: 90
+
+      - name: Nuestro propio inventario, en el resumen del pase
+        shell: bash
+        env:
+          FINDINGS: ${{ steps.pqc.outputs.findings }}
+          TRUNCATED: ${{ steps.pqc.outputs.truncated }}
+        run: |
+          set -euo pipefail
+          echo "findings=$FINDINGS truncated=$TRUNCATED"
+          { echo "## Our own inventory"; echo; cat PQC-REPORT.md; } >> "$GITHUB_STEP_SUMMARY"
