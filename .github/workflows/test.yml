@@ -139,3 +139,37 @@ jobs:
                   print(f'{f}: valida contra CycloneDX 1.6')
           sys.exit(1 if bad else 0)
           PY
+
+  # La prueba definitiva de adopción: consumir la referencia PUBLICADA, resuelta por GitHub desde la
+  # etiqueta, exactamente la línea que está en el README. Los trabajos de arriba usan ./, que prueba
+  # el código pero no prueba que la línea del README funcione — eso depende de que la etiqueta exista
+  # y de que GitHub la resuelva. En el repositorio anterior esa línea estaba ROTA (la etiqueta no
+  # contenía la acción), así que aquí se vigila.
+  stranger:
+    name: la línea del README, tal cual
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - id: pqc
+        uses: johnInarti/pqc-readiness-action@v1
+        with:
+          path: test/fixtures/vulnerable
+          output: cbom-published.json
+      - shell: bash
+        env:
+          FINDINGS: ${{ steps.pqc.outputs.findings }}
+          CBOM: ${{ steps.pqc.outputs.cbom }}
+        run: |
+          set -euo pipefail
+          echo "findings=$FINDINGS cbom=$CBOM"
+          test "$FINDINGS" -gt 0
+          test -f "$CBOM"
+          node -e '
+            const c = JSON.parse(require("fs").readFileSync(process.env.CBOM, "utf8"));
+            if (c.specVersion !== "1.6") throw new Error("no es CycloneDX 1.6");
+            const v = c.components.filter(x => (x.properties||[]).some(p => p.name === "fractalai:quantum_vulnerable" && p.value === "true"));
+            if (!v.some(x => x.name.includes("RSA"))) throw new Error("no encontro RSA");
+            console.log("la referencia publicada funciona:", v.map(x => x.name).join(", "));
+          '
