@@ -612,6 +612,63 @@ check('the step publishes the ratchet and the truncation as usable outputs', () 
   assert(/sarif<<PQC_EOF_[0-9a-f]{32}/.test(written), 'the sarif path is not delimited');
 });
 
+// ─────────────── El contrato entre el manifiesto y el escaner ───────────────
+// Esta prueba existe por un fallo concreto: se anadio la entrada `report` al escaner y se olvido
+// declararla en action.yml, asi que la accion la IGNORABA en silencio y solo un aviso perdido en el
+// log decia "Unexpected input(s) 'report'". Las pruebas que llamaban al escaner directamente
+// pasaban, porque el agujero estaba en el manifiesto, no en el codigo. Un contrato entre dos
+// archivos que nadie comprueba se rompe en el tercer cambio.
+check('every input the scanner reads is declared in action.yml and wired through env', () => {
+  const scan = fs.readFileSync(SCAN, 'utf8');
+  const manifest = fs.readFileSync(path.join(HERE, '..', 'action.yml'), 'utf8');
+
+  // input('PQC_FOO', 'foo', default) -> la pareja (variable de entorno, nombre de la entrada)
+  const pairs = [...scan.matchAll(/input\(\s*'([A-Z_]+)'\s*,\s*'([a-z-]+)'/g)]
+    .map((m) => ({ env: m[1], name: m[2] }));
+  assert(pairs.length >= 8, `expected the scanner to read several inputs, found ${pairs.length}`);
+
+  const declared = new Set([...manifest.matchAll(/^ {2}([a-z][a-z0-9-]*):$/gm)].map((m) => m[1]));
+  const wired = new Set([...manifest.matchAll(/^ {8}([A-Z_]+):/gm)].map((m) => m[1]));
+
+  const undeclared = pairs.filter((x) => !declared.has(x.name)).map((x) => x.name);
+  assert(undeclared.length === 0, `inputs read by the scanner but not declared in action.yml: ${undeclared}`);
+
+  const unwired = pairs.filter((x) => !wired.has(x.env)).map((x) => `${x.name} (${x.env})`);
+  assert(unwired.length === 0, `inputs declared but never passed through env, so the action ignores them: ${unwired}`);
+});
+
+check('every output the scanner writes is declared in action.yml', () => {
+  const scan = fs.readFileSync(SCAN, 'utf8');
+  const manifest = fs.readFileSync(path.join(HERE, '..', 'action.yml'), 'utf8');
+  // Las lineas que el escaner escribe en GITHUB_OUTPUT, en sus dos formas.
+  const written = new Set([
+    ...[...scan.matchAll(/`([a-z]+)=\$\{/g)].map((m) => m[1]),
+    ...[...scan.matchAll(/`([a-z]+)<<\$\{/g)].map((m) => m[1]),
+  ]);
+  assert(written.size >= 4, `expected several step outputs, found ${[...written]}`);
+  const outsBlock = manifest.slice(manifest.indexOf('\noutputs:'), manifest.indexOf('\nruns:'));
+  for (const name of written) {
+    assert(new RegExp(`^ {2}${name}:$`, 'm').test(outsBlock),
+      `the scanner writes the step output '${name}' but action.yml does not declare it, so no caller can read it`);
+  }
+});
+
+// Los pasos de una accion composite NO admiten `continue-on-error`. Si un paso que depende de un
+// permiso opcional no se guarda a mano, una falta de permisos tumba el pase de quien nos adopte por
+// algo que quiza ni sabe que existe.
+check('every optional step guards itself, since composite steps cannot continue-on-error', () => {
+  const manifest = fs.readFileSync(path.join(HERE, '..', 'action.yml'), 'utf8');
+  // Solo CLAVES reales, no texto: la primera version de esta prueba disparaba por el propio
+  // comentario del manifiesto que explica por que no se puede usar continue-on-error.
+  const realKey = manifest.split('\n').some((l) => /^\s*continue-on-error\s*:/.test(l) && !/^\s*#/.test(l));
+  assert(!realKey, 'action.yml uses continue-on-error as a step key, which composite action steps silently ignore');
+  const runsBlock = manifest.slice(manifest.indexOf('\nruns:'));
+  // La subida a code scanning y el comentario del pull request dependen de permisos opcionales:
+  // ambos deben acabar en `exit 0` o estar encadenados con `||`.
+  assert(/exit 0/.test(runsBlock), 'the optional steps do not force a successful exit');
+  assert(/\|\|\s*echo/.test(runsBlock), 'the pull-request comment step is not guarded with ||');
+});
+
 // ───────────────────────────── Result ─────────────────────────────
 fs.rmSync(WORK, { recursive: true, force: true });
 console.log('');

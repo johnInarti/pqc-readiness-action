@@ -50,6 +50,14 @@ inputs:
     required: false
     default: 'false'
 
+  report:
+    description: >-
+      Where to write a human-readable Markdown report, ordered by real urgency: key agreement and
+      key transport first, because traffic recorded today is decryptable later, then what the
+      deadline governs. This is the document a person reads and an auditor asks for. Empty to skip.
+    required: false
+    default: ''
+
   fail-on-findings:
     description: >-
       Fail the job if any quantum-vulnerable cryptography is found at all. Honest but unusable on a
@@ -115,6 +123,7 @@ runs:
         PQC_PATH: ${{ inputs.path }}
         PQC_OUTPUT: ${{ inputs.output }}
         PQC_SARIF: ${{ inputs.sarif }}
+        PQC_REPORT: ${{ inputs.report }}
         PQC_BASELINE: ${{ inputs.baseline }}
         PQC_WRITE_BASELINE: ${{ inputs.write-baseline }}
         PQC_FAIL_ON_INCREASE: ${{ inputs.fail-on-increase }}
