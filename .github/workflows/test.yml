@@ -1,0 +1,141 @@
+name: test
+
+# La batería de regresión del escáner en los tres sistemas operativos, más la validación del CBOM
+# contra el esquema oficial publicado, más el consumo de la propia acción por referencia `uses:`
+# exactamente como lo hará un desconocido.
+#
+# Cada caso de test/suite.mjs existe porque un asedio adversarial rompió de verdad esta
+# herramienta antes de publicarla. Está escrita en Node y no en Python a propósito:
+# windows-latest no trae python3.
+
+on:
+  push: { branches: [main] }
+  pull_request:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  suite:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: node --version
+      - run: node test/suite.mjs
+
+  action:
+    name: la acción misma, en los tres sistemas
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: pqc
+        uses: ./
+        with:
+          path: test/fixtures/vulnerable
+          output: out/cbom.json
+
+      - name: Las salidas sirven y el CBOM es real
+        shell: bash
+        env:
+          FINDINGS: ${{ steps.pqc.outputs.findings }}
+          CBOM: ${{ steps.pqc.outputs.cbom }}
+        run: |
+          set -euo pipefail
+          echo "findings=$FINDINGS cbom=$CBOM"
+          test "$FINDINGS" -gt 0
+          test -f "$CBOM"
+          node -e '
+            const c = JSON.parse(require("fs").readFileSync(process.env.CBOM, "utf8"));
+            if (c.specVersion !== "1.6") throw new Error("no es CycloneDX 1.6");
+            const vuln = c.components.filter(x => (x.properties||[]).some(p => p.name === "fractalai:quantum_vulnerable" && p.value === "true"));
+            if (!vuln.some(x => x.name.includes("RSA"))) throw new Error("no encontro RSA");
+            for (const x of c.components) for (const p of (x.properties||[]))
+              if (p.name === "fractalai:location" && p.value.includes("\\")) throw new Error("separador de Windows en el CBOM");
+            console.log("CBOM valido:", vuln.map(x => x.name).join(", "));
+          '
+
+      - name: Un repo post-cuántico no debe dar ni un falso positivo
+        id: clean
+        uses: ./
+        with:
+          path: test/fixtures/resistant
+          output: out/clean.json
+      - shell: bash
+        env: { FINDINGS: '${{ steps.clean.outputs.findings }}' }
+        run: test "$FINDINGS" = "0" || { echo "::error::falso positivo sobre codigo post-cuantico"; exit 1; }
+
+      # El agujero crítico que tuvo esta acción: las entradas se interpolaban dentro del shell del
+      # composite, así que un repo que cableara `path` desde el título de un pull request entregaba
+      # ejecución de comandos en su propio runner. Esto lo vigila para siempre.
+      - name: 'Seguridad: una entrada hostil es dato, no comando'
+        continue-on-error: true
+        uses: ./
+        with:
+          path: '$(touch PWNED_RCE; echo hola)'
+          output: out/inject.json
+      - shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e PWNED_RCE || { echo "::error::INYECCION DE COMANDOS"; exit 1; }
+          echo "la entrada hostil se trato como ruta literal"
+
+      - name: 'Puerta de corte: fail-on-findings debe fallar el pase'
+        id: gate
+        continue-on-error: true
+        uses: ./
+        with:
+          path: test/fixtures/vulnerable
+          output: out/gate.json
+          fail-on-findings: 'true'
+      - shell: bash
+        env: { OUTCOME: '${{ steps.gate.outcome }}' }
+        run: test "$OUTCOME" = "failure" || { echo "::error::la puerta de corte no corto el pase"; exit 1; }
+
+  conformance:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generar tres CBOM distintos
+        run: |
+          set -euo pipefail
+          node scan.mjs --path=test/fixtures/vulnerable --output=cbom-vuln.json
+          node scan.mjs --path=test/fixtures/resistant  --output=cbom-clean.json
+          node scan.mjs --path=.                        --output=cbom-self.json
+
+      - name: Validar contra el esquema oficial de CycloneDX 1.6
+        run: |
+          set -euo pipefail
+          curl -sSfL -o bom-1.6.schema.json https://raw.githubusercontent.com/CycloneDX/specification/master/schema/bom-1.6.schema.json
+          python3 -m pip install --quiet jsonschema rfc3339-validator
+          python3 - <<'PY'
+          import json, sys, jsonschema
+          schema = json.load(open('bom-1.6.schema.json'))
+          # El comprobador de formatos NO trae date-time por defecto: sin rfc3339-validator el
+          # formato del timestamp se omite en silencio y la validacion pasa sin validar eso.
+          fc = jsonschema.FormatChecker()
+          assert 'date-time' in fc.checkers, 'date-time no registrado: la validacion seria incompleta'
+          V = jsonschema.Draft7Validator(schema, format_checker=fc)
+          bad = False
+          for f in ('cbom-vuln.json', 'cbom-clean.json', 'cbom-self.json'):
+              errs = sorted(V.iter_errors(json.load(open(f))), key=lambda e: list(e.path))
+              if errs:
+                  bad = True
+                  print(f'::error::{f} no valida contra CycloneDX 1.6 ({len(errs)} error(es))')
+                  for e in errs[:8]:
+                      print('   ', list(e.path), e.message[:200])
+              else:
+                  print(f'{f}: valida contra CycloneDX 1.6')
+          sys.exit(1 if bad else 0)
+          PY

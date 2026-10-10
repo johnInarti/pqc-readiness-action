@@ -1,0 +1,52 @@
+name: 'PQC Readiness Scan (CBOM)'
+description: 'Find the quantum-vulnerable cryptography in your repo and emit a CycloneDX CBOM. NIST deprecates these algorithms after 2030 and disallows them after 2035.'
+author: 'FRACTAL AI S.A.S.'
+branding:
+  icon: 'shield'
+  color: 'purple'
+inputs:
+  path:
+    description: 'Directory to scan.'
+    required: false
+    default: '.'
+  output:
+    description: 'Where to write the CycloneDX CBOM. Must stay inside the workspace.'
+    required: false
+    default: 'cbom.json'
+  fail-on-findings:
+    description: 'Exit non-zero if quantum-vulnerable cryptography is found. Default false: this is an inventory, not a gate.'
+    required: false
+    default: 'false'
+  seal:
+    description: >-
+      PREVIEW, not yet usable from this Action. It would request an ML-DSA-65 (FIPS 204) signature
+      over a redacted copy of the CBOM from FractalAI. The endpoint answers 402 Payment Required and
+      this Action carries no x402 payment client, so today setting this only prints the price and
+      what would be sent. The scan and the CBOM are free and always run entirely in your runner.
+    required: false
+    default: 'false'
+outputs:
+  findings:
+    description: 'Total number of quantum-vulnerable occurrences found (occurrences, not distinct algorithms).'
+    value: ${{ steps.scan.outputs.findings }}
+  cbom:
+    description: 'Path to the generated CBOM.'
+    value: ${{ steps.scan.outputs.cbom }}
+runs:
+  using: 'composite'
+  steps:
+    # Every input reaches the scanner through the ENVIRONMENT, never interpolated into this
+    # shell script. That is not style: `run: node x --path="${{ inputs.path }}"` lets the
+    # runner paste the raw input text into the script BEFORE bash parses it, so any workflow
+    # that wires an input from a pull-request title, an issue body or a dispatch field hands
+    # command execution to whoever wrote that text, with the job's secrets in scope. Values
+    # passed via `env:` are never re-parsed by bash, so the same payload stays inert data.
+    - id: scan
+      shell: bash
+      env:
+        PQC_ACTION_PATH: ${{ github.action_path }}
+        PQC_PATH: ${{ inputs.path }}
+        PQC_OUTPUT: ${{ inputs.output }}
+        PQC_FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
+        PQC_SEAL: ${{ inputs.seal }}
+      run: node "$PQC_ACTION_PATH/scan.mjs"
