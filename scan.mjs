@@ -42,12 +42,20 @@ const ROOT = path.resolve(input('PQC_PATH', 'path', '.'));
 const OUT_RAW = input('PQC_OUTPUT', 'output', 'cbom.json');
 const FAIL = input('PQC_FAIL_ON_FINDINGS', 'fail-on-findings', 'false') === 'true';
 const SEAL = input('PQC_SEAL', 'seal', 'false') === 'true';
+const SARIF_RAW = input('PQC_SARIF', 'sarif', '');
+const REPORT_RAW = input('PQC_REPORT', 'report', '');
+const BASELINE_RAW = input('PQC_BASELINE', 'baseline', '');
+const FAIL_ON_INCREASE = input('PQC_FAIL_ON_INCREASE', 'fail-on-increase', 'false') === 'true';
+const WRITE_BASELINE = input('PQC_WRITE_BASELINE', 'write-baseline', 'false') === 'true';
 /**
  * Destino del sellado. La variable de entorno existe para poder probar contra un servidor local,
  * pero en Actions el `env` de un workflow o de un workflow reutilizable que no controlas se hereda
  * hacia abajo: sin restringirla, alguien podía redirigir el sellado a otro host, en texto claro, y
  * el log no lo decía. Ahora solo se acepta https y SIEMPRE se imprime el destino antes de enviar.
  */
+/** Una sola fuente de verdad: el CBOM y el SARIF deben declarar la MISMA version. */
+const TOOL_VERSION = '1.1.0';
+
 const DEFAULT_API = 'https://fractalai.net.co';
 let API = DEFAULT_API;
 let API_OVERRIDDEN = false;
@@ -102,6 +110,11 @@ function safeOutPath(raw) {
   return abs;
 }
 const OUT = safeOutPath(OUT_RAW);
+// Las rutas adicionales pasan por la MISMA guarda. Una segunda salida sin validar habria sido una
+// puerta trasera al mismo agujero de escritura arbitraria que ya se cerro para la primera.
+const SARIF_OUT = SARIF_RAW ? safeOutPath(SARIF_RAW) : null;
+const REPORT_OUT = REPORT_RAW ? safeOutPath(REPORT_RAW) : null;
+const BASELINE_PATH = BASELINE_RAW ? safeOutPath(BASELINE_RAW) : null;
 // Lo que se escribe es la ruta absoluta ya validada; lo que se PUBLICA como salida del paso y se
 // imprime es la que pidió quien nos llama, porque es la que su propio workflow sabe consumir
 // (`path: ${{ steps.x.outputs.cbom }}` en upload-artifact). Ya está validada, así que es segura.
@@ -113,6 +126,32 @@ const OUT_LABEL = OUT_RAW;
  * permite falsificar colores, mover el cursor y tapar líneas reales del propio pase.
  */
 const clean = (s) => String(s).replace(/[\u0000-\u001f\u007f-\u009f]/g, '?');
+
+/**
+ * Urgencia, que NO es lo mismo que la fecha límite.
+ *
+ * Un inventario de 836 ocurrencias sin orden es inservible: nadie sabe por dónde empezar y el
+ * informe acaba archivado. Pero ordenar por «gravedad» inventada sería peor. Hay una distinción
+ * criptográfica real y defendible, y es la única que usamos:
+ *
+ *   `harvest`  — El daño YA empezó. Un acuerdo de claves (ECDH, X25519, Diffie-Hellman) y el
+ *                transporte de claves con RSA protegen tráfico que un adversario puede CAPTURAR HOY
+ *                y descifrar el día que exista un computador cuántico. Migrar en 2029 no repara el
+ *                tráfico grabado en 2026. Esto se arregla primero y no admite esperar a la fecha.
+ *
+ *   `deadline` — El daño empieza en la fecha. Una firma (ECDSA, EdDSA, DSA) hecha hoy no se puede
+ *                falsificar retroactivamente: el riesgo aparece cuando haya que seguir FIRMANDO y
+ *                verificando después de 2030, y para artefactos de vida larga (firmware, raíces de
+ *                confianza, firma de código) cuya validez tiene que sobrevivir al plazo.
+ *
+ *   `inventory` — No es un sitio donde se ejecute criptografía, es una dependencia declarada o
+ *                material de clave en el repositorio. Va al inventario y pide una decisión humana,
+ *                no un cambio de código inmediato.
+ *
+ * RSA cae en `harvest` a propósito, aunque también firme: un barrido estático no puede distinguir
+ * si una referencia a RSA es transporte de claves o firma, y ante la duda se asume la lectura que
+ * implica exposición retroactiva. Se dice en el texto, no se esconde en una puntuación.
+ */
 
 /**
  * Quantum-vulnerable primitives per NIST IR 8547.
@@ -130,42 +169,52 @@ const clean = (s) => String(s).replace(/[\u0000-\u001f\u007f-\u009f]/g, '?');
  * `why` says which deadline applies and what replaces it.
  */
 const VULNERABLE = [
-  { id: 'rsa', name: 'RSA', primitive: 'pke', nistQuantum: 0,
+  { id: 'rsa', name: 'RSA', primitive: 'pke', nistQuantum: 0, urgency: 'harvest',
+    whyNow: 'If any of these sites is key transport, traffic captured today is decryptable later. A static scan cannot tell transport from signing, so this is treated as retroactive exposure.',
     fns: ['sign', 'verify', 'encrypt', 'decrypt', 'keygen'], oid: '1.2.840.113549.1.1.1',
     re: /(?<![A-Za-z])(?:RSA|rsaEncryption|RSASSA(?:-PSS)?|PKCS#?1(?:v15)?(?![0-9])|genrsa|RSAES)(?![A-Za-z])|(?<![A-Za-z])RS[Aa](?=Crypto|Key|KeyPair|Signature|Private|Public|Params|Encrypt|Decrypt|Sign|Verify|OAEP|PSS|Pkcs|Pss)|(?<![A-Za-z])(?:RS|PS)(?:256|384|512)(?![A-Za-z0-9])/i,
     why: 'Signature and key transport. Deprecated after 2030, disallowed after 2035 (NIST IR 8547). Replace signatures with ML-DSA (FIPS 204), key transport with ML-KEM (FIPS 203).' },
 
-  { id: 'ecdsa', name: 'ECDSA', primitive: 'signature', nistQuantum: 0,
+  { id: 'ecdsa', name: 'ECDSA', primitive: 'signature', nistQuantum: 0, urgency: 'deadline',
+    whyNow: 'Signatures made today cannot be forged retroactively. The risk arrives at the deadline, and earlier for artefacts whose validity must outlive it: firmware, trust roots, code signing.',
     fns: ['sign', 'verify', 'keygen'], oid: '1.2.840.10045.4.3.2',
     re: /(?<![A-Za-z])(?:ECDSA|secp(?:192|224|256|384|521)[kr]1|prime(?:192|239|256)v[123]|P-?(?:256|384|521)|ES(?:256|384|512)K?|nistp(?:256|384|521)|X9_62_PRIME256V1|ECC_NIST_P(?:256|384|521)|ECC_SECG_P256K1|EC_SIGN_P(?:256|384)|EC_prime256v1|SHA(?:1|224|256|384|512)with(?:EC)?DSA)(?![A-Za-z])|(?<![A-Za-z])ECDsa(?=Cng|Certificate|OpenSsl|P256|P384|P521)|(?<![A-Za-z])ECDSA_P(?:256|384|521)/i,
     why: 'Elliptic-curve signature. Deprecated after 2030, disallowed after 2035. Replace with ML-DSA (FIPS 204) or SLH-DSA (FIPS 205).' },
 
   // ECDH y X25519 acuerdan claves; NO firman. Declararles cryptoFunctions ["sign"] convertiría el
   // inventario en una lista falsa de sitios de firma, que es justo lo que un plan de migración usa.
-  { id: 'ecdh', name: 'ECDH', primitive: 'key-agree', nistQuantum: 0,
+  { id: 'ecdh', name: 'ECDH', primitive: 'key-agree', nistQuantum: 0, urgency: 'harvest',
+    whyNow: 'Harvest now, decrypt later. Traffic an adversary records today is decryptable once a quantum computer exists, so migrating in 2029 does not repair 2026 traffic.',
     fns: ['keyderive', 'keygen'], oid: '1.3.132.1.12',
-    re: /(?<![A-Za-z])(?:ECDHE?|ECDiffieHellman[A-Za-z]*)(?![A-Za-z])/i,
+    // `createECDH` hace falta explicito: es la API mas usada de Node para acuerdo de claves y la
+    // frontera por letra la bloqueaba, porque "ECDH" va precedido de la "e" de "create". La
+    // frontera es correcta y no se toca; lo que se anade es el nombre real de la funcion.
+    re: /(?<![A-Za-z])(?:ECDHE?|createECDH|ECDiffieHellman[A-Za-z]*|computeSecret)(?![A-Za-z])/i,
     why: 'Key agreement. Harvest-now-decrypt-later applies: traffic captured today can be decrypted once a quantum computer exists. Replace with ML-KEM (FIPS 203), hybrid during transition.' },
 
-  { id: 'x25519', name: 'X25519 / X448', primitive: 'key-agree', nistQuantum: 0,
+  { id: 'x25519', name: 'X25519 / X448', primitive: 'key-agree', nistQuantum: 0, urgency: 'harvest',
+    whyNow: 'Harvest now, decrypt later. Same retroactive exposure as ECDH: recorded traffic cannot be un-recorded.',
     fns: ['keyderive', 'keygen'], oid: '1.3.101.110',
     re: /(?<![A-Za-z])(?:X25519|X448|curve25519|crypto_box|nacl\.box|box\.GenerateKey|sodium_crypto_box_keypair)(?![A-Za-z])/i,
     why: 'Montgomery-curve key agreement, including the NaCl/libsodium box APIs. Same harvest-now-decrypt-later exposure as ECDH. Replace with ML-KEM (FIPS 203).' },
 
-  { id: 'eddsa', name: 'Ed25519 / Ed448 (EdDSA)', primitive: 'signature', nistQuantum: 0,
+  { id: 'eddsa', name: 'Ed25519 / Ed448 (EdDSA)', primitive: 'signature', nistQuantum: 0, urgency: 'deadline',
+    whyNow: 'Signatures made today cannot be forged retroactively. The risk arrives at the deadline, and earlier for long-lived artefacts.',
     fns: ['sign', 'verify', 'keygen'], oid: '1.3.101.112',
     re: /(?<![A-Za-z])(?:Ed25519|Ed448|EdDSA|edwards25519|ssh-ed25519|nacl\.sign|sodium_crypto_sign_keypair)(?![A-Za-z])/i,
     why: 'Edwards-curve signature. Same quantum exposure as ECDSA. Replace with ML-DSA (FIPS 204).' },
 
-  { id: 'dh', name: 'Diffie-Hellman (finite field)', primitive: 'key-agree', nistQuantum: 0,
+  { id: 'dh', name: 'Diffie-Hellman (finite field)', primitive: 'key-agree', nistQuantum: 0, urgency: 'harvest',
+    whyNow: 'Harvest now, decrypt later. Recorded traffic is decryptable after the fact.',
     fns: ['keyderive', 'keygen'], oid: '1.2.840.113549.1.3.1',
-    re: /(?<![A-Za-z])(?:DHE?-RSA|diffie[-_ ]?hellman|dhparam|MODP|EVP_PKEY_DH|PKey::DH|DH-?(?:1024|2048|3072|4096))(?![A-Za-z])/i,
+    re: /(?<![A-Za-z])(?:DHE?-RSA|diffie[-_ ]?hellman|createDiffieHellman|getDiffieHellman|dhparam|MODP|EVP_PKEY_DH|PKey::DH|DH-?(?:1024|2048|3072|4096))(?![A-Za-z])/i,
     why: 'Finite-field key agreement. Deprecated after 2030. Replace with ML-KEM (FIPS 203).' },
 
   // La lista de lookbehind DEBE conservar las variantes con guión bajo: bajo una frontera por
   // letra, el `_` ya no bloquea, así que ML_DSA y SLH_DSA pasarían a ser falsos positivos. Reportar
   // ML-DSA como vulnerable es el error que haría que un criptógrafo tirara esto a la basura.
-  { id: 'dsa', name: 'DSA', primitive: 'signature', nistQuantum: 0,
+  { id: 'dsa', name: 'DSA', primitive: 'signature', nistQuantum: 0, urgency: 'deadline',
+    whyNow: 'Signatures made today cannot be forged retroactively, and DSA was already discouraged before quantum computers entered the argument.',
     fns: ['sign', 'verify', 'keygen'], oid: '1.2.840.10040.4.1',
     re: /(?<![A-Za-z])(?<!ML-)(?<!ML_)(?<!SLH-)(?<!SLH_)(?:DSA|dsaEncryption|DSA-?(?:1024|2048|3072)|SHA(?:1|224|256)withDSA|PKey::DSA)(?![A-Za-z])/i,
     why: 'Legacy signature, already discouraged pre-quantum. Replace with ML-DSA (FIPS 204).' },
@@ -175,7 +224,8 @@ const VULNERABLE = [
   // "BEGIN CERTIFICATE" a secas requiere parsear el DER, así que se declara como activo de
   // algoritmo no determinado y NO se afirma que sea vulnerable.
   { id: 'keymaterial', name: 'X.509 / SSH key material (algorithm from label)',
-    primitive: 'unknown', fns: ['unknown'],
+    primitive: 'unknown', fns: ['unknown'], urgency: 'inventory',
+    whyNow: 'Key material in a repository is an inventory and hygiene question before it is a quantum one: decide whether it belongs there at all, then whether its algorithm survives the deadline.',
     re: /-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?(?:PRIVATE KEY|PUBLIC KEY|CERTIFICATE|CERTIFICATE REQUEST)-----|(?<![A-Za-z])(?:ssh-rsa|ssh-dss|ecdsa-sha2-nistp(?:256|384|521)|sk-ssh-ed25519)(?![A-Za-z])/,
     why: 'Key material or a certificate is committed in the repository. For ssh-rsa, ssh-dss, ecdsa-sha2-* and "BEGIN RSA/EC/DSA PRIVATE KEY" the label names the algorithm. A bare PKCS#8 "BEGIN PRIVATE KEY" or "BEGIN CERTIFICATE" needs DER parsing, so it is listed as an asset of undetermined algorithm, not asserted to be vulnerable.' },
 
@@ -183,7 +233,8 @@ const VULNERABLE = [
   // un monedero completo de blockchain (secp256k1 de punta a punta) salía como limpio. Solo se
   // aplica a archivos de manifiesto, para que «ring» u «openssl» no casen en prosa.
   { id: 'dependency', name: 'Dependency implementing classical cryptography',
-    primitive: 'unknown', fns: ['unknown'], manifestOnly: true,
+    primitive: 'unknown', fns: ['unknown'], manifestOnly: true, urgency: 'inventory',
+    whyNow: 'A declared dependency is an inventory entry, not a call site: the primitive travels with your build but this scan does not prove your code reaches it.',
     re: /(?:^|[@/"'\s=:,>])(?:elliptic|tweetnacl|ethers|web3|bitcoinjs-lib|ecpair|tiny-secp256k1|jsrsasign|node-forge|sshpk|jsonwebtoken|jose|python-jose|pyjwt|paramiko|pycryptodome|cryptography|pynacl|coincurve|eth-keys|k256|p256|ring|openssl|rsa|ecdsa|bcprov[\w-]*|bouncycastle[\w.]*|java-jwt|web3j|go-ethereum|btcec|edwards25519|golang-jwt|NSec[\w.]*|Nethereum[\w.]*|@solana\/web3\.js|@noble\/(?:secp256k1|ed25519|curves)|firebase\/php-jwt|ethereumjs)(?:["'\s=:,<\[\]/]|$)/i,
     why: 'A declared dependency whose purpose is RSA, ECDSA, EdDSA, secp256k1 or Diffie-Hellman. This is an inventory entry about the library, not a claim that your own call sites use it: the primitive lives in the dependency and travels with your build.' },
 ];
@@ -285,7 +336,15 @@ const MAX_LOCATIONS = 200;
  * apoyará en una cobertura que nunca existió.
  */
 const skipped = { fileCap: false, depthCap: 0, tooBig: 0, unreadable: 0, skippedDirs: new Set(),
-  longLines: 0, notUtf8: 0, deadline: false, byteBudget: false };
+  longLines: 0, notUtf8: 0, deadline: false, byteBudget: false, ownOutput: 0, inventoryDoc: 0 };
+
+/** Rutas que este propio pase escribe. Se saltan siempre, pase lo que pase. */
+const OWN_OUTPUTS = new Set([OUT, SARIF_OUT, BASELINE_PATH, REPORT_OUT].filter(Boolean).map((x) => path.resolve(x)));
+/** Un documento que ES un inventario (CycloneDX o SARIF), venga de nosotros o de otra herramienta. */
+// Se reconoce por CONTENIDO y no por nombre a proposito: un archivo de linea base renombrado, o
+// copiado a otra carpeta, seguia envenenando el barrido porque lleva dentro los identificadores de
+// las familias ("rsa", "ecdsa"). El nombre es una convencion; el contenido es un hecho.
+const IS_INVENTORY_DOC = /"bomFormat"\s*:\s*"CycloneDX"|sarif-schema-2\.1\.0|"\$schema"\s*:\s*"[^"]*sarif|"tool"\s*:\s*"pqc-readiness-scan"/i;
 
 function walk(dir, acc = [], depth = 0) {
   if (acc.length >= MAX_FILES) { skipped.fileCap = true; return acc; }
@@ -342,6 +401,14 @@ for (const f of files) {
   if (Date.now() - startedAt > DEADLINE_MS) { skipped.deadline = true; break; }
   if (totalBytes > MAX_TOTAL_BYTES) { skipped.byteBudget = true; break; }
 
+  // No escanear nuestras PROPIAS salidas. Un CBOM contiene por definicion los nombres de los
+  // algoritmos que inventaria, asi que leerlo infla las cifras con hallazgos que son nuestro propio
+  // informe: en una prueba, un repositorio con 3 lineas reales reportaba 15 ocurrencias, 12 de
+  // ellas leidas del cbom.json recien escrito. Y no es solo un artefacto de la misma corrida:
+  // cualquiera que COMMITEE su CBOM, que es justo lo que recomendamos, envenenaria todos los pases
+  // siguientes. Se excluye por ruta y, para los documentos ya commiteados, por contenido.
+  if (OWN_OUTPUTS.has(path.resolve(f))) { skipped.ownOutput++; continue; }
+
   let text = '';
   try {
     if (fs.statSync(f).size > MAX_BYTES) { skipped.tooBig++; continue; }
@@ -355,6 +422,10 @@ for (const f of files) {
     else text = buf.toString('utf8');
     totalBytes += buf.length;
   } catch { skipped.unreadable++; continue; }
+
+  // Un inventario ajeno tambien es un inventario: si el archivo ES un CBOM o un SARIF, sus
+  // menciones de algoritmos son metadatos de un informe, no sitios donde se ejecute criptografia.
+  if (IS_INVENTORY_DOC.test(text.slice(0, 4096))) { skipped.inventoryDoc++; continue; }
 
   // Separadores POSIX siempre. Un CBOM se archiva, se difunde y se compara; con los separadores
   // nativos de Windows el mismo repositorio produciría dos documentos distintos.
@@ -452,6 +523,8 @@ if (skipped.depthCap) coverageNotes.push(`${skipped.depthCap} directory branch(e
 if (skipped.tooBig) coverageNotes.push(`${skipped.tooBig} file(s) over ${MAX_BYTES} bytes were skipped`);
 if (skipped.longLines) coverageNotes.push(`${skipped.longLines} line(s) over ${MAX_LINE} characters were not matched`);
 if (skipped.notUtf8) coverageNotes.push(`${skipped.notUtf8} file(s) were not UTF-8 text and were not matched`);
+if (skipped.ownOutput) coverageNotes.push(`${skipped.ownOutput} of this scan's own output file(s) were excluded on purpose`);
+if (skipped.inventoryDoc) coverageNotes.push(`${skipped.inventoryDoc} existing CBOM/SARIF inventory document(s) were excluded on purpose: their algorithm names are report metadata, not call sites`);
 if (skipped.deadline) coverageNotes.push(`the ${DEADLINE_MS}ms deadline was reached, so the scan is INCOMPLETE (raise PQC_TIMEOUT_MS)`);
 if (skipped.byteBudget) coverageNotes.push(`the ${MAX_TOTAL_BYTES}-byte total budget was reached, so the scan is INCOMPLETE`);
 if (skipped.unreadable) coverageNotes.push(`${skipped.unreadable} path(s) could not be read`);
@@ -465,7 +538,7 @@ const cbom = {
   version: 1,
   metadata: {
     timestamp: now,
-    tools: { components: [{ type: 'application', 'bom-ref': 'tool/pqc-readiness-scan', name: 'pqc-readiness-scan', publisher: 'FRACTAL AI S.A.S.', version: '1.0.0' }] },
+    tools: { components: [{ type: 'application', 'bom-ref': 'tool/pqc-readiness-scan', name: 'pqc-readiness-scan', publisher: 'FRACTAL AI S.A.S.', version: TOOL_VERSION }] },
     properties: [
       { name: 'fractalai:scope', value: 'Static scan of manifests and source for quantum-vulnerable primitives. NOT a proof of absence: misses dynamic loading, vendored binaries, hardware modules and unrecognised abstractions. NOT a compliance certification.' },
       { name: 'fractalai:deadline', value: 'NIST IR 8547: RSA/ECDSA/ECDH/DH/DSA deprecated after 2030, disallowed after 2035.' },
@@ -488,6 +561,12 @@ const cbom = {
       evidence: { occurrences: e.hits.map((h) => ({ location: h.file, line: h.line })) },
       properties: [
         { name: 'fractalai:quantum_vulnerable', value: 'true' },
+        // La urgencia va en el documento para que nadie la tenga que INFERIR. El comentario del
+        // pull request la deducia del `primitive`, y eso daba mal RSA: su primitive es `pke` pero
+        // su urgencia es `harvest`, porque un barrido estatico no puede saber si una referencia a
+        // RSA es transporte de claves o firma. Dos lugares calculando lo mismo acaban discrepando.
+        { name: 'fractalai:urgency', value: e.def.urgency },
+        { name: 'fractalai:why_now', value: e.def.whyNow || '' },
         { name: 'fractalai:why', value: e.why },
         { name: 'fractalai:occurrences', value: String(codeOf(e)) },
         { name: 'fractalai:matching_lines', value: String(e.codeLines) },
@@ -518,6 +597,290 @@ const cbom = {
 // puede escribir, y antes reventaba con ENOENT después de haber hecho todo el trabajo.
 fs.mkdirSync(path.dirname(OUT), { recursive: true });
 fs.writeFileSync(OUT, JSON.stringify(cbom, null, 2) + '\n');
+
+/**
+ * Salida SARIF 2.1.0, opcional.
+ *
+ * Por que importa mas que el propio CBOM: GitHub ingiere SARIF en Code Scanning, asi que los
+ * hallazgos dejan de ser un archivo JSON que nadie abre y aparecen en la pestana de seguridad del
+ * repositorio y ANOTADOS dentro del diff de cada pull request, en la interfaz que el equipo ya usa.
+ * Es gratis en repositorios publicos.
+ *
+ * Sobre el nivel declarado, que es una decision deliberada y no un descuido: NINGUN hallazgo se
+ * emite como `error`. Un `error` en Code Scanning bloquea revisiones en muchas configuraciones, y
+ * esto es un INVENTARIO, no una vulnerabilidad explotable hoy. Marcar 800 lineas de un repositorio
+ * grande como errores el primer dia consigue una sola cosa: que desactiven la herramienta. Lo que
+ * si se distingue es la urgencia real (ver el modelo de `urgency` mas arriba), que viaja en
+ * `security-severity` para que el equipo pueda ordenar y filtrar.
+ */
+const SARIF_LEVEL = {
+  harvest:   { level: 'warning', severity: '7.0' },  // el dano ya empezo: trafico grabado hoy
+  deadline:  { level: 'warning', severity: '4.0' },  // el dano empieza en la fecha
+  inventory: { level: 'note',    severity: '2.0' },  // decision humana, no cambio de codigo
+};
+
+function buildSarif() {
+  const used = [...found.values()].filter((e) => codeOf(e) > 0);
+  const rules = used.map((e) => {
+    const u = SARIF_LEVEL[e.def.urgency] || SARIF_LEVEL.inventory;
+    return {
+      id: `pqc/${e.def.id}`,
+      name: `QuantumVulnerable${e.def.id.replace(/[^a-z0-9]/gi, '')}`,
+      shortDescription: { text: `${e.name} is quantum-vulnerable` },
+      fullDescription: { text: `${e.why} ${e.def.whyNow || ''}`.trim() },
+      help: {
+        text: `${e.why}\n\nWhy now: ${e.def.whyNow || 'See NIST IR 8547.'}\n\nThis is a static scan: it is evidence to start a migration from, not a proof of absence and not a compliance certification.`,
+        markdown: [
+          `**${e.name}**`, '',
+          e.why, '',
+          `**Why now.** ${e.def.whyNow || 'See NIST IR 8547.'}`, '',
+          '_This is a static scan: evidence to start a migration from, not a proof of absence and not a compliance certification._',
+        ].join('\n'),
+      },
+      defaultConfiguration: { level: u.level },
+      properties: {
+        'security-severity': u.severity,
+        tags: ['cryptography', 'post-quantum', `urgency/${e.def.urgency}`, 'external/cwe/cwe-327'],
+        precision: 'medium',
+      },
+    };
+  });
+
+  const results = [];
+  for (const e of used) {
+    const u = SARIF_LEVEL[e.def.urgency] || SARIF_LEVEL.inventory;
+    for (const h of e.hits) {
+      results.push({
+        ruleId: `pqc/${e.def.id}`,
+        level: u.level,
+        message: { text: `${e.name}: ${e.why}` },
+        locations: [{
+          physicalLocation: {
+            artifactLocation: { uri: h.file, uriBaseId: 'SRCROOT' },
+            region: { startLine: h.line },
+          },
+        }],
+        // La huella estable es lo que permite a GitHub reconocer el MISMO hallazgo entre pases y no
+        // abrir una alerta nueva cada vez que alguien mueve una linea. Sin esto el panel se llena
+        // de duplicados y deja de servir.
+        partialFingerprints: {
+          pqcFamilyFile: crypto.createHash('sha256').update(`${e.def.id} ${h.file}`).digest('hex').slice(0, 32),
+        },
+      });
+    }
+  }
+
+  return {
+    $schema: 'https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json',
+    version: '2.1.0',
+    runs: [{
+      tool: {
+        driver: {
+          name: 'PQC Readiness Scan',
+          version: TOOL_VERSION,
+          informationUri: 'https://github.com/johnInarti/pqc-readiness-action',
+          rules,
+        },
+      },
+      // Lo que NO se pudo mirar viaja con el resultado. Un panel de seguridad que muestra cero
+      // hallazgos sobre un barrido truncado es peor que un panel vacio.
+      invocations: [{
+        executionSuccessful: true,
+        toolExecutionNotifications: coverageNotes.map((n) => ({
+          level: 'warning',
+          message: { text: `Coverage limit: ${n}` },
+          descriptor: { id: 'pqc/coverage' },
+        })),
+      }],
+      results,
+      columnKind: 'utf16CodeUnits',
+    }],
+  };
+}
+
+
+/**
+ * Informe legible por una persona, opcional.
+ *
+ * El CBOM lo lee una herramienta y el SARIF lo lee GitHub. Falta el documento que lee una PERSONA:
+ * el responsable que tiene que decidir presupuesto, y el auditor que pregunta por el inventario.
+ * Ese documento es el entregable real de la primera fase de cualquier migracion, y hasta ahora
+ * nuestro adoptante tenia que construirselo a mano desde un JSON.
+ *
+ * Va ordenado por urgencia y no por cantidad a proposito: la familia con 300 ocurrencias de firma
+ * NO es la primera que hay que mirar si hay una de acuerdo de claves con 3, porque esa ultima ya
+ * esta perdiendo trafico hoy. Ordenar por el numero grande seria mas impresionante y peor consejo.
+ */
+function buildReport() {
+  const used = [...found.values()].filter((e) => codeOf(e) > 0);
+  const harvest = used.filter((e) => e.def.urgency === 'harvest').sort((a, b) => codeOf(b) - codeOf(a));
+  const deadline = used.filter((e) => e.def.urgency === 'deadline').sort((a, b) => codeOf(b) - codeOf(a));
+  const inventory = used.filter((e) => e.def.urgency === 'inventory').sort((a, b) => codeOf(b) - codeOf(a));
+  const L = [];
+
+  L.push('# Post-quantum readiness inventory', '');
+  L.push(`Generated ${now} by [PQC Readiness Scan](https://github.com/johnInarti/pqc-readiness-action) ${TOOL_VERSION}.`, '');
+  L.push(`**${files.length} files read. ${totalHits} occurrence(s) of quantum-vulnerable cryptography in code, across ${codeFamilies} algorithm family(ies).**`, '');
+
+  L.push('## What this is, and what it is not', '');
+  L.push('This is a **static scan** of manifests and source text. It is evidence to start a migration from.', '');
+  L.push('It is **not a proof of absence.** It cannot see cryptography reached through dynamic loading, compiled into vendored binaries, or performed inside a hardware security module. Zero findings in a family means nothing matched, not that nothing is there.', '');
+  L.push('It is **not a compliance certification**, and no auditor should accept it as one.', '');
+  if (coverageNotes.length) {
+    L.push('### This particular scan did not read everything', '');
+    for (const n of coverageNotes) L.push(`- ${n}`);
+    L.push('', 'Any conclusion below is bounded by that list.', '');
+  } else {
+    L.push('No cap was hit on this run: every file matching the scan rules under the scanned path was read.', '');
+  }
+
+  L.push('## The deadline', '');
+  L.push('NIST IR 8547 deprecates RSA, ECDSA, ECDH, finite-field Diffie-Hellman and DSA **after 2030** and disallows them **after 2035**. CNSA 2.0 brings that forward to **2027** for US national-security systems.', '');
+
+  if (harvest.length) {
+    L.push('## First: what is already losing ground', '');
+    L.push('These are key agreement and key transport. The exposure is **retroactive**: an adversary can record protected traffic today and decrypt it once a quantum computer exists, so migrating in 2029 does not repair traffic captured in 2026. These do not wait for the deadline.', '');
+    L.push('| Algorithm | Occurrences | Lines | Replace with |', '|---|---:|---:|---|');
+    for (const e of harvest) L.push(`| ${e.name} | ${codeOf(e)} | ${e.codeLines} | ML-KEM (FIPS 203), hybrid during transition |`);
+    L.push('');
+    for (const e of harvest) {
+      L.push(`### ${e.name}`, '', e.why, '');
+      if (e.def.whyNow) L.push(`**Why it cannot wait.** ${e.def.whyNow}`, '');
+      L.push('Locations:', '');
+      for (const h of e.hits.slice(0, 20)) L.push(`- \`${h.file}:${h.line}\``);
+      if (codeOf(e) > e.hits.length) L.push(`- … ${codeOf(e) - e.hits.length} more occurrence(s) not listed individually`);
+      L.push('');
+    }
+  }
+
+  if (deadline.length) {
+    L.push('## Second: what the deadline governs', '');
+    L.push('These are signatures. A signature made today cannot be forged retroactively, so the risk arrives at the deadline — and earlier for anything whose validity must outlive it: firmware, trust roots, code signing, long-dated certificates.', '');
+    L.push('| Algorithm | Occurrences | Lines | Replace with |', '|---|---:|---:|---|');
+    for (const e of deadline) L.push(`| ${e.name} | ${codeOf(e)} | ${e.codeLines} | ML-DSA (FIPS 204), or SLH-DSA (FIPS 205) where a hash-based signature fits |`);
+    L.push('');
+    for (const e of deadline) {
+      L.push(`### ${e.name}`, '', e.why, '');
+      L.push('Locations:', '');
+      for (const h of e.hits.slice(0, 20)) L.push(`- \`${h.file}:${h.line}\``);
+      if (codeOf(e) > e.hits.length) L.push(`- … ${codeOf(e) - e.hits.length} more occurrence(s) not listed individually`);
+      L.push('');
+    }
+  }
+
+  if (inventory.length) {
+    L.push('## Third: inventory and decisions, not code changes', '');
+    L.push('These are declared dependencies and key material found in the repository. The primitive travels with the build, but this scan does not prove your own code reaches it, so each one needs a human decision rather than an edit.', '');
+    L.push('| Item | Occurrences |', '|---|---:|');
+    for (const e of inventory) L.push(`| ${e.name} | ${codeOf(e)} |`);
+    L.push('');
+  }
+
+  if (resistant.size) {
+    L.push('## Already quantum-resistant here', '');
+    for (const [, r] of resistant) L.push(`- **${r.name}** — ${r.count} occurrence(s)`);
+    L.push('', 'Reported so the inventory is not one-sided: a migration plan that ignores what is already done wastes effort re-doing it.', '');
+  }
+
+  if (totalAside) {
+    L.push('## Mentions deliberately not counted', '');
+    L.push(`${totalAside} further mention(s) appear in comments, documentation, test vectors, or in lines that FORBID an algorithm. They are recorded in the CBOM and excluded from the counts above: a hardening policy that says \`deny_signature = RSA\` is not a place where RSA lives, and counting it would invert the meaning of the file.`, '');
+  }
+
+  if (baselineReport) {
+    L.push('## Against the baseline', '');
+    const { worse, better } = baselineReport;
+    if (!worse.length && !better.length) L.push('No change in any algorithm family since the baseline was frozen.', '');
+    else {
+      L.push('| Algorithm | Baseline | Now | Change |', '|---|---:|---:|---|');
+      for (const w of worse) L.push(`| ${w.name} | ${w.from} | ${w.to} | **+${w.to - w.from}** |`);
+      for (const b of better) L.push(`| ${b.name} | ${b.from} | ${b.to} | −${b.from - b.to} |`);
+      L.push('');
+    }
+  }
+
+  L.push('## How to read the numbers', '');
+  L.push('An occurrence is one match on one line. A line matching two families counts once for each, because both are present. The occurrence count is the real total; only the **locations** are capped, and whenever that happens the document says so explicitly.', '');
+
+  return L.join('\n') + '\n';
+}
+
+
+/**
+ * Linea base y trinquete.
+ *
+ * Por que esto decide si la herramienta sobrevive en un repositorio real. `fail-on-findings` es
+ * inutilizable el primer dia: un monorepo tiene cientos de ocurrencias, nadie puede arreglarlas en
+ * una tarde, asi que la puerta se queda apagada para siempre y la herramienta se vuelve decorativa.
+ * Lo que un equipo SI puede aceptar el primer dia es no empeorar. Se congela el estado actual como
+ * linea base y el pase falla solo cuando el numero SUBE. Eso convierte una migracion imposible de
+ * empezar en una cuesta que solo baja, y es el mismo patron que hizo adoptables las puertas de
+ * cobertura de pruebas.
+ *
+ * La comparacion es por familia y no por total: si alguien quita veinte usos de RSA y anade uno de
+ * ECDH, el total baja y el trinquete tiene que saltar igual, porque ECDH es exposicion retroactiva
+ * y RSA en ese repo podia no serlo. Un solo numero esconde exactamente el cambio que importa.
+ */
+function currentCounts() {
+  const out = {};
+  for (const [id, e] of found) if (codeOf(e) > 0) out[id] = codeOf(e);
+  return out;
+}
+
+let baselineReport = null;
+if (BASELINE_PATH && fs.existsSync(BASELINE_PATH)) {
+  let prev = null;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(BASELINE_PATH, 'utf8'));
+    prev = parsed && typeof parsed.counts === 'object' ? parsed.counts : null;
+  } catch { prev = null; }
+  if (!prev) {
+    console.error(`  baseline: ${clean(BASELINE_RAW)} is not a readable baseline file; refusing to guess.`);
+    process.exit(2);
+  }
+  const now = currentCounts();
+  const ids = [...new Set([...Object.keys(prev), ...Object.keys(now)])].sort();
+  const worse = [], better = [], same = [];
+  for (const id of ids) {
+    const a = Number(prev[id] || 0), b = Number(now[id] || 0);
+    const name = (found.get(id)?.name) || (VULNERABLE.find((v) => v.id === id)?.name) || id;
+    if (b > a) worse.push({ id, name, from: a, to: b });
+    else if (b < a) better.push({ id, name, from: a, to: b });
+    else if (b > 0) same.push({ id, name, at: b });
+  }
+  baselineReport = { worse, better, same, baseline_at: null };
+  try { baselineReport.baseline_at = JSON.parse(fs.readFileSync(BASELINE_PATH, 'utf8')).created_at || null; } catch { /* opcional */ }
+}
+
+if (WRITE_BASELINE && BASELINE_PATH) {
+  fs.mkdirSync(path.dirname(BASELINE_PATH), { recursive: true });
+  fs.writeFileSync(BASELINE_PATH, JSON.stringify({
+    tool: 'pqc-readiness-scan',
+    version: TOOL_VERSION,
+    created_at: now,
+    note: 'Frozen counts per algorithm family, for the ratchet. Regenerate deliberately: overwriting this file forgives every regression since it was written.',
+    counts: currentCounts(),
+    files_scanned: files.length,
+    coverage_limits: coverageNotes,
+  }, null, 2) + '\n');
+}
+
+/**
+ * Un UNICO punto donde se escriben las salidas derivadas, y esta despues de que TODO este
+ * calculado: el CBOM, la cobertura y el trinquete. Antes cada salida se escribia junto al codigo
+ * que la generaba, y dos veces seguidas eso dejo una escritura por ENCIMA de la declaracion de la
+ * que dependia: ReferenceError en cuanto alguien pedia esa salida, con el barrido ya hecho. La
+ * leccion es de orden, no de sintaxis: lo derivado se escribe al final, en un sitio, o se repite
+ * el mismo fallo en la tercera salida que alguien anada.
+ */
+if (SARIF_OUT) {
+  fs.mkdirSync(path.dirname(SARIF_OUT), { recursive: true });
+  fs.writeFileSync(SARIF_OUT, JSON.stringify(buildSarif(), null, 2) + '\n');
+}
+if (REPORT_OUT) {
+  fs.mkdirSync(path.dirname(REPORT_OUT), { recursive: true });
+  fs.writeFileSync(REPORT_OUT, buildReport());
+}
 
 // ── Report (this is what a human reads in the CI log) ──
 const red = (s) => `\x1b[31m${s}\x1b[0m`;
@@ -566,6 +929,20 @@ if (resistant.size) {
   console.log(grn(`  Already quantum-resistant: ${[...resistant.values()].map((r) => r.name).join(', ')}`));
   console.log('');
 }
+// El trinquete, si hay linea base. Se imprime ANTES del cierre porque es lo unico que un equipo en
+// mitad de una migracion lee de verdad: no le interesa el total, le interesa si hoy empeoro.
+if (baselineReport) {
+  const { worse, better } = baselineReport;
+  console.log(dim(`  Compared against the baseline${baselineReport.baseline_at ? ` frozen ${baselineReport.baseline_at.slice(0, 10)}` : ''}:`));
+  if (!worse.length && !better.length) {
+    console.log(dim('      no change in any algorithm family.'));
+  } else {
+    for (const w of worse) console.log(red(`      ▲ ${w.name}: ${w.from} → ${w.to} (+${w.to - w.from})`));
+    for (const b of better) console.log(grn(`      ▼ ${b.name}: ${b.from} → ${b.to} (−${b.from - b.to})`));
+  }
+  console.log('');
+}
+
 console.log(dim('  Deadline: NIST IR 8547 deprecates these after 2030 and disallows them after 2035.'));
 console.log(dim(SEAL
   ? '  This inventory is free and ran entirely in your runner. seal: true, so a redacted copy is sent next.'
@@ -670,7 +1047,17 @@ if (gh) {
   // GitHub para valores multilínea. Concatenar `nombre=valor` a pelo deja que el valor declare
   // variables adicionales que un paso posterior se creería.
   const delim = 'PQC_EOF_' + crypto.randomBytes(16).toString('hex');
-  fs.appendFileSync(gh, `findings=${Number(totalHits) || 0}\ncbom<<${delim}\n${OUT_LABEL}\n${delim}\n`);
+  const increased = baselineReport ? baselineReport.worse.length : 0;
+  const decreased = baselineReport ? baselineReport.better.length : 0;
+  const lines = [
+    `findings=${Number(totalHits) || 0}`,
+    `cbom<<${delim}`, OUT_LABEL, delim,
+    `increased=${increased}`,
+    `decreased=${decreased}`,
+    `truncated=${coverageNotes.length ? 'true' : 'false'}`,
+  ];
+  if (SARIF_OUT) { const d2 = 'PQC_EOF_' + crypto.randomBytes(16).toString('hex'); lines.push(`sarif<<${d2}`, SARIF_RAW, d2); }
+  fs.appendFileSync(gh, lines.join('\n') + '\n');
 }
 const sum = process.env.GITHUB_STEP_SUMMARY;
 if (sum) {
@@ -678,6 +1065,12 @@ if (sum) {
     '## PQC Readiness Scan',
     '',
     `${files.length} files scanned. **${codeFamilies} quantum-vulnerable algorithm families, ${totalHits} occurrences in code.**`,
+    ...(baselineReport ? ['', '### Against the baseline', '',
+      ...(baselineReport.worse.length || baselineReport.better.length
+        ? ['| Algorithm | Baseline | Now | Change |', '|---|---:|---:|---|',
+           ...baselineReport.worse.map((w) => `| ${w.name} | ${w.from} | ${w.to} | **+${w.to - w.from}** |`),
+           ...baselineReport.better.map((b) => `| ${b.name} | ${b.from} | ${b.to} | −${b.from - b.to} |`)]
+        : ['No change in any algorithm family.'])] : []),
     ...(totalAside ? ['', `${totalAside} further mentions in comments, documentation, test material or in lines that forbid the algorithm. Listed in the CBOM, not counted here.`] : []),
     ...(coverageNotes.length ? ['', `Coverage limits: ${coverageNotes.join('; ')}`] : []),
     '',
@@ -689,4 +1082,28 @@ if (sum) {
   ].join('\n'));
 }
 
+/**
+ * Dos puertas, y la que importa es la segunda.
+ *
+ * `fail-on-findings` es honesta pero inservible el primer dia en un repositorio real: hay cientos
+ * de ocurrencias, nadie puede quitarlas en una tarde, asi que la puerta se queda apagada para
+ * siempre. `fail-on-increase` es la que un equipo acepta el primer dia, porque no pide arreglar
+ * nada: pide no empeorar. Y falla por FAMILIA, no por total, porque cambiar veinte usos de firma
+ * por uno de acuerdo de claves baja el total y empeora la exposicion real.
+ */
+if (FAIL_ON_INCREASE && baselineReport && baselineReport.worse.length) {
+  console.log(red(`  fail-on-increase: ${baselineReport.worse.length} algorithm family(ies) went UP against the baseline.`));
+  console.log(dim('  Nothing here asks you to fix the existing inventory. It asks you not to add to it.'));
+  if (process.env.GITHUB_ACTIONS) {
+    console.log(`::error title=Quantum-vulnerable cryptography increased::${baselineReport.worse.map((w) => `${w.name} ${w.from} to ${w.to}`).join('; ')}`);
+  }
+  process.exit(1);
+}
+if (FAIL_ON_INCREASE && !baselineReport) {
+  // Pedir la puerta sin linea base no puede pasar en silencio: el pase se pondria verde para
+  // siempre y el equipo creeria tener una proteccion que no existe.
+  console.log(red('  fail-on-increase was requested but there is no baseline to compare against.'));
+  console.log(dim('  Create one with write-baseline: true and commit the file, then this gate becomes real.'));
+  process.exit(2);
+}
 if (FAIL && totalHits > 0) process.exit(1);

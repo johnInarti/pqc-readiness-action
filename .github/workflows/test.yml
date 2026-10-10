@@ -89,6 +89,61 @@ jobs:
           test ! -e PWNED_RCE || { echo "::error::INYECCION DE COMANDOS"; exit 1; }
           echo "la entrada hostil se trato como ruta literal"
 
+      # El trinquete de punta a punta A TRAVES de la accion: congelar, no empeorar, empeorar.
+      - name: 'Trinquete: congelar la linea base'
+        uses: ./
+        with:
+          path: test/fixtures/vulnerable
+          output: out/rb.json
+          baseline: out/baseline.json
+          write-baseline: 'true'
+          sarif: ''
+
+      - name: 'Trinquete: sin cambios no debe cortar'
+        id: same
+        uses: ./
+        with:
+          path: test/fixtures/vulnerable
+          output: out/rb.json
+          baseline: out/baseline.json
+          fail-on-increase: 'true'
+          sarif: ''
+
+      - name: 'Trinquete: anadir criptografia nueva SI debe cortar'
+        id: worse
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p /tmp/ratchet && cp -r test/fixtures/vulnerable/* /tmp/ratchet/
+          printf 'const k = crypto.createECDH("prime256v1");\n' > /tmp/ratchet/added.js
+          node scan.mjs --path=/tmp/ratchet --output=out/rb2.json --baseline=out/baseline.json --fail-on-increase=true
+          echo "no_corto=si" >> "$GITHUB_OUTPUT"
+
+      - name: 'Trinquete: y su corte es observable'
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.worse.outcome }}
+        run: |
+          set -euo pipefail
+          test "$OUTCOME" = "failure" || { echo "::error::el trinquete no corto al anadir criptografia"; exit 1; }
+          echo "el trinquete corta al empeorar"
+
+      - name: 'El informe legible se escribe y lleva sus propios limites'
+        uses: ./
+        with:
+          path: test/fixtures/vulnerable
+          output: out/rep.json
+          report: out/PQC-REPORT.md
+          sarif: ''
+      - shell: bash
+        run: |
+          set -euo pipefail
+          test -s out/PQC-REPORT.md
+          grep -q "not a proof of absence" out/PQC-REPORT.md
+          grep -q "not a compliance certification" out/PQC-REPORT.md
+          echo "el informe lleva sus limites"
+
       - name: 'Puerta de corte: fail-on-findings debe fallar el pase'
         id: gate
         continue-on-error: true
@@ -113,6 +168,40 @@ jobs:
           node scan.mjs --path=test/fixtures/vulnerable --output=cbom-vuln.json
           node scan.mjs --path=test/fixtures/resistant  --output=cbom-clean.json
           node scan.mjs --path=.                        --output=cbom-self.json
+
+      - name: Generar tambien el SARIF y el informe
+        run: |
+          set -euo pipefail
+          node scan.mjs --path=test/fixtures/vulnerable --output=sv.json --sarif=sv.sarif --report=sv.md
+          test -s sv.sarif
+          test -s sv.md
+
+      # El README afirma "SARIF 2.1.0". Esa frase se comprueba contra el esquema publicado, no de
+      # palabra: lo va a ingerir GitHub, y un SARIF invalido se rechaza entero sin decir por que.
+      - name: Validar el SARIF contra el esquema oficial 2.1.0
+        run: |
+          set -euo pipefail
+          curl -sSfL -o sarif-schema.json https://json.schemastore.org/sarif-2.1.0.json
+          python3 -m pip install --quiet jsonschema rfc3339-validator
+          python3 - <<'PY'
+          import json, sys, jsonschema
+          V = jsonschema.Draft7Validator(json.load(open('sarif-schema.json')),
+                                         format_checker=jsonschema.FormatChecker())
+          doc = json.load(open('sv.sarif'))
+          errs = sorted(V.iter_errors(doc), key=lambda e: list(e.path))
+          if errs:
+              print(f'::error::el SARIF no valida ({len(errs)} error(es))')
+              for e in errs[:8]:
+                  print('   ', list(e.path), e.message[:200])
+              sys.exit(1)
+          run0 = doc['runs'][0]
+          # Ninguna regla puede salir como `error`: un error en Code Scanning bloquea revisiones, y
+          # esto es un inventario, no una vulnerabilidad explotable hoy.
+          for r in run0['tool']['driver']['rules']:
+              assert r['defaultConfiguration']['level'] != 'error', r['id'] + ' sale como error'
+              assert r['properties']['security-severity'], r['id'] + ' sin security-severity'
+          print('SARIF valido, reglas:', len(run0['tool']['driver']['rules']), 'resultados:', len(run0['results']))
+          PY
 
       - name: Validar contra el esquema oficial de CycloneDX 1.6
         run: |
@@ -173,3 +262,33 @@ jobs:
             if (!v.some(x => x.name.includes("RSA"))) throw new Error("no encontro RSA");
             console.log("la referencia publicada funciona:", v.map(x => x.name).join(", "));
           '
+
+  # La integracion con la interfaz de GitHub: subir el SARIF a code scanning y dejar el comentario.
+  # Se prueba en un pull request real porque es donde vive, y con los permisos concedidos, que es la
+  # unica forma de saber que el camino feliz funciona y no solo el degradado.
+  integration:
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - id: pqc
+        uses: ./
+        with:
+          path: test/fixtures/vulnerable
+          output: cbom.json
+          sarif: pqc.sarif
+          upload-sarif: 'true'
+          comment-on-pr: 'true'
+          report: PQC-REPORT.md
+      - shell: bash
+        env:
+          SARIF: ${{ steps.pqc.outputs.sarif }}
+        run: |
+          set -euo pipefail
+          test -s "$SARIF"
+          test -s PQC-REPORT.md
+          echo "sarif=$SARIF y el informe se escribieron; la subida y el comentario quedan en el log de arriba"

@@ -100,6 +100,20 @@ check('finds UPPER_SNAKE API names that a word boundary used to hide', () => {
   assert(names.some((n) => n.includes('X25519')), `x25519_dalek missed: ${names}`);
 });
 
+check('finds the Node key-agreement APIs by their function names', () => {
+  // La frontera por letra, que es correcta y arreglo el 61% de fallos de deteccion, bloqueaba de
+  // rebote los nombres en CamelCase: en `crypto.createECDH(...)` el "ECDH" va precedido por la "e"
+  // de "create". Es la API mas usada de Node para acuerdo de claves, es decir el caso de urgencia
+  // `harvest`, y pasaba invisible. Lo encontro la propia bateria al probar el trinquete.
+  const d = fixture('nodeapi', {
+    'a.js': "const k = crypto.createECDH('prime256v1');\nconst d = crypto.createDiffieHellman(2048);\nconst g = crypto.getDiffieHellman('modp14');\n",
+  });
+  run([`--path=${d}`, '--output=nodeapi.json']);
+  const names = vulnNames(cbom('nodeapi.json'));
+  assert(names.some((n) => n === 'ECDH'), `createECDH missed: ${names}`);
+  assert(names.some((n) => n.includes('Diffie-Hellman')), `createDiffieHellman missed: ${names}`);
+});
+
 check('finds the JWT algorithm identifiers, including ES256K', () => {
   const d = fixture('jwt', { 'a.ts': "const a='RS256';\nconst b='PS256';\nconst c='ES256K';\nconst e='RS512';\n" });
   run([`--path=${d}`, '--output=jwt.json']);
@@ -381,6 +395,221 @@ check('no source line content is ever stored in the CBOM', () => {
   const raw = fs.readFileSync(path.join(WORK, 'leak.json'), 'utf8');
   assert(!raw.includes(secret), 'source line content leaked into the CBOM');
   assert(!r.out.includes(secret), 'source line content leaked into the log');
+});
+
+// ───────────────────── SARIF: la salida que vive en la interfaz de GitHub ─────────────────────
+const sarif = (name) => JSON.parse(fs.readFileSync(path.join(WORK, name), 'utf8'));
+
+check('emits valid SARIF 2.1.0 with one rule per family and stable fingerprints', () => {
+  const d = fixture('sarif', { 'src/a.js': 'const s = crypto.createSign("RSA-SHA256");\nconst k = crypto.createECDH("secp256k1");\n' });
+  const r = run([`--path=${d}`, '--output=s.json', '--sarif=s.sarif']);
+  assert(r.code === 0, `exit ${r.code}`);
+  const doc = sarif('s.sarif');
+  assert(doc.version === '2.1.0', `version ${doc.version}`);
+  const run0 = doc.runs[0];
+  assert(run0.tool.driver.name === 'PQC Readiness Scan', 'tool name');
+  assert(run0.tool.driver.rules.length > 0, 'no rules');
+  assert(run0.results.length > 0, 'no results');
+  for (const res of run0.results) {
+    assert(run0.tool.driver.rules.some((x) => x.id === res.ruleId), `result ${res.ruleId} has no rule`);
+    const loc = res.locations[0].physicalLocation;
+    assert(loc.artifactLocation.uri && !loc.artifactLocation.uri.includes('\\'), `bad uri ${loc.artifactLocation.uri}`);
+    assert(typeof loc.region.startLine === 'number', 'no startLine');
+    // Sin huella estable GitHub abre una alerta NUEVA cada vez que alguien mueve una linea, el
+    // panel se llena de duplicados y el equipo deja de mirarlo.
+    assert(res.partialFingerprints && res.partialFingerprints.pqcFamilyFile, 'no partialFingerprints');
+  }
+});
+
+// Un `error` en Code Scanning bloquea revisiones en muchas configuraciones. Esto es un INVENTARIO,
+// no una vulnerabilidad explotable hoy: marcar 800 lineas como errores el primer dia consigue una
+// sola cosa, que desactiven la herramienta.
+check('no SARIF finding is emitted at error level', () => {
+  const d = fixture('sarif2', { 'a.js': 'const s = crypto.createSign("RSA-SHA256");\nconst k = "X25519";\nconst j = "ES256";\n' });
+  run([`--path=${d}`, '--output=s2.json', '--sarif=s2.sarif']);
+  const doc = sarif('s2.sarif');
+  for (const rule of doc.runs[0].tool.driver.rules) {
+    assert(rule.defaultConfiguration.level !== 'error', `${rule.id} is error level`);
+    assert(rule.properties['security-severity'], `${rule.id} has no security-severity`);
+  }
+  for (const res of doc.runs[0].results) assert(res.level !== 'error', `${res.ruleId} result is error level`);
+});
+
+check('key agreement ranks above signatures in SARIF severity', () => {
+  const d = fixture('sev', { 'a.js': 'const k = "X25519";\nconst j = "ES256";\n' });
+  run([`--path=${d}`, '--output=sev.json', '--sarif=sev.sarif']);
+  const rules = sarif('sev.sarif').runs[0].tool.driver.rules;
+  const sevOf = (id) => Number(rules.find((r) => r.id === id)?.properties['security-severity'] || 0);
+  // Harvest-now-decrypt-later: el trafico grabado hoy no se puede des-grabar, asi que un sitio de
+  // acuerdo de claves no puede ordenarse por debajo de uno de firma.
+  assert(sevOf('pqc/x25519') > sevOf('pqc/ecdsa'),
+    `key agreement ${sevOf('pqc/x25519')} must outrank signature ${sevOf('pqc/ecdsa')}`);
+});
+
+check('truncated coverage travels inside the SARIF, not only in the log', () => {
+  const d = fixture('sarifcov', { 'big.js': 'const k = crypto.createSign("RSA-SHA256");\n'.repeat(60000), 'ok.js': 'const x = "ECDSA";\n' });
+  run([`--path=${d}`, '--output=sc.json', '--sarif=sc.sarif']);
+  const inv = sarif('sc.sarif').runs[0].invocations[0];
+  assert(inv.toolExecutionNotifications.length > 0, 'coverage limits missing from the SARIF');
+  assert(/Coverage limit/.test(inv.toolExecutionNotifications[0].message.text), 'notification text');
+});
+
+// ─────────────────── Trinquete: la puerta que un equipo acepta el primer dia ───────────────────
+check('the baseline freezes a count per family, not a single total', () => {
+  const d = fixture('base1', { 'a.js': 'const s = crypto.createSign("RSA-SHA256");\nconst k = "X25519";\n' });
+  const r = run([`--path=${d}`, '--output=b1.json', '--baseline=bl.json', '--write-baseline=true']);
+  assert(r.code === 0, `exit ${r.code}`);
+  const bl = JSON.parse(fs.readFileSync(path.join(WORK, 'bl.json'), 'utf8'));
+  assert(bl.counts && typeof bl.counts === 'object', 'no counts object');
+  assert(Object.keys(bl.counts).length >= 2, `expected per-family counts, got ${JSON.stringify(bl.counts)}`);
+  assert(bl.created_at, 'no created_at');
+});
+
+check('the ratchet does not fire when nothing changed', () => {
+  const d = fixture('base2', { 'a.js': 'const s = crypto.createSign("RSA-SHA256");\n' });
+  run([`--path=${d}`, '--output=b2.json', '--baseline=bl2.json', '--write-baseline=true']);
+  const r = run([`--path=${d}`, '--output=b2.json', '--baseline=bl2.json', '--fail-on-increase=true']);
+  assert(r.code === 0, `the gate fired on an unchanged repository (exit ${r.code})`);
+});
+
+check('the ratchet fires when a family goes up, and says which', () => {
+  const d = fixture('base3', { 'a.js': 'const s = crypto.createSign("RSA-SHA256");\n' });
+  run([`--path=${d}`, '--output=b3.json', '--baseline=bl3.json', '--write-baseline=true']);
+  fs.writeFileSync(path.join(WORK, d, 'new.js'), 'const k = crypto.createECDH("prime256v1");\n');
+  const r = run([`--path=${d}`, '--output=b3.json', '--baseline=bl3.json', '--fail-on-increase=true'], { GITHUB_ACTIONS: '1' });
+  assert(r.code === 1, `expected exit 1, got ${r.code}`);
+  assert(/went UP/.test(r.out), 'the log does not say what went up');
+  assert(/::error title=/.test(r.out), 'no run annotation, so it is invisible outside the log');
+});
+
+// Una familia de firma que baja y una de acuerdo de claves que sube puede DEJAR IGUAL el total y
+// empeorar la exposicion real. Comparar un solo numero esconde exactamente el cambio que importa.
+check('the ratchet compares per family, so a swap that keeps the total still fires', () => {
+  const d = fixture('base4', { 'a.js': 'const j = "ES256";\nconst k = "ES384";\n' });
+  run([`--path=${d}`, '--output=b4.json', '--baseline=bl4.json', '--write-baseline=true']);
+  fs.writeFileSync(path.join(WORK, d, 'a.js'), 'const j = "ES256";\nconst k = crypto.createECDH("prime256v1");\n');
+  const r = run([`--path=${d}`, '--output=b4.json', '--baseline=bl4.json', '--fail-on-increase=true']);
+  assert(r.code === 1, `a family went up but the gate stayed quiet (exit ${r.code})`);
+});
+
+check('the ratchet reports improvement instead of staying silent', () => {
+  const d = fixture('base5', { 'a.js': 'const s = crypto.createSign("RSA-SHA256");\nconst k = "X25519";\n' });
+  run([`--path=${d}`, '--output=b5.json', '--baseline=bl5.json', '--write-baseline=true']);
+  fs.writeFileSync(path.join(WORK, d, 'a.js'), 'const x = 1;\n');
+  const r = run([`--path=${d}`, '--output=b5.json', '--baseline=bl5.json', '--fail-on-increase=true']);
+  assert(r.code === 0, `exit ${r.code}`);
+  assert(/▼/.test(r.out), 'the improvement was not reported');
+});
+
+// Pedir la puerta sin linea base no puede pasar en silencio: el pase se pondria verde para siempre
+// y el equipo creeria tener una proteccion que no existe.
+check('asking for the gate with no baseline fails loudly instead of passing green', () => {
+  const d = fixture('base6', { 'a.js': 'const s = crypto.createSign("RSA-SHA256");\n' });
+  const r = run([`--path=${d}`, '--output=b6.json', '--baseline=missing.json', '--fail-on-increase=true']);
+  assert(r.code === 2, `expected exit 2, got ${r.code}`);
+  assert(/no baseline/.test(r.out), 'the reason was not stated');
+});
+
+check('a corrupt baseline is refused rather than guessed at', () => {
+  const d = fixture('base7', { 'a.js': 'const s = crypto.createSign("RSA-SHA256");\n' });
+  fs.writeFileSync(path.join(WORK, 'bad.json'), '{"not":"a baseline"}');
+  const r = run([`--path=${d}`, '--output=b7.json', '--baseline=bad.json']);
+  assert(r.code === 2, `a corrupt baseline was accepted (exit ${r.code})`);
+});
+
+// ─────────────── Autoexclusion: la herramienta no puede contarse a si misma ───────────────
+check('the scan never reads its own output, so two runs agree', () => {
+  const d = fixture('self', { 'a.js': 'const s = crypto.createSign("RSA-SHA256");\nconst k = "X25519";\n' });
+  // El CBOM contiene por definicion los nombres de los algoritmos que inventaria: leerlo inflaba
+  // las cifras con hallazgos que eran nuestro propio informe.
+  run([`--path=${d}`, `--output=${d}/cbom.json`, `--sarif=${d}/out.sarif`]);
+  const first = Number(/(\d+) occurrence\(s\) in code/.exec(run([`--path=${d}`, '--output=x1.json'])?.out || '')?.[1] || -1);
+  const second = Number(/(\d+) occurrence\(s\) in code/.exec(run([`--path=${d}`, '--output=x2.json'])?.out || '')?.[1] || -2);
+  assert(first === second && first === 2, `self-pollution: ${first} vs ${second}, expected 2`);
+});
+
+check('an existing CBOM or baseline committed under any name is excluded by content', () => {
+  const d = fixture('self2', { 'a.js': 'const s = crypto.createSign("RSA-SHA256");\n' });
+  // Renombrados a proposito: la exclusion debe ser por CONTENIDO, no por nombre de archivo.
+  fs.writeFileSync(path.join(WORK, d, 'inventory-archive.json'), JSON.stringify({ bomFormat: 'CycloneDX', specVersion: '1.6', components: [{ name: 'RSA' }, { name: 'ECDSA' }] }));
+  fs.writeFileSync(path.join(WORK, d, 'frozen-counts.json'), JSON.stringify({ tool: 'pqc-readiness-scan', counts: { rsa: 9, ecdsa: 9, x25519: 9 } }));
+  const r = run([`--path=${d}`, '--output=s2b.json']);
+  const n = Number(/(\d+) occurrence\(s\) in code/.exec(r.out)?.[1] || -1);
+  assert(n === 1, `a renamed inventory document poisoned the scan: ${n} occurrences, expected 1`);
+  assert(/excluded on purpose/.test(r.out), 'the exclusion was silent instead of disclosed');
+});
+
+// ─────────────────────── Dependencias transitivas de los lock files ───────────────────────
+check('transitive dependencies in lock files are inventoried', () => {
+  const d = fixture('locks', {
+    'package-lock.json': JSON.stringify({ lockfileVersion: 3, packages: { 'node_modules/elliptic': { version: '6.5.4' }, 'node_modules/node-forge': { version: '1.3.1' } } }, null, 2),
+    'Cargo.lock': '[[package]]\nname = "ring"\nversion = "0.17.5"\n',
+    'go.sum': 'github.com/btcsuite/btcd/btcec/v2 v2.3.2 h1:abc=\n',
+    'app.ts': 'export const x = 1;\n',
+  });
+  const r = run([`--path=${d}`, '--output=locks.json']);
+  assert(r.code === 0, `exit ${r.code}`);
+  const names = vulnNames(cbom('locks.json'));
+  // Sin esta capa un monedero completo de blockchain, secp256k1 de punta a punta, sale limpio.
+  assert(names.some((n) => n.includes('Dependency')), `lock-file dependencies missed: ${names}`);
+});
+
+// ─────────────────────────── El informe para una persona ───────────────────────────
+check('the written report leads with harvest-now-decrypt-later, not with the biggest number', () => {
+  const d = fixture('rep', {
+    // Muchas firmas y UNA sola de acuerdo de claves: ordenar por cantidad pondria las firmas
+    // primero, y seria el peor consejo posible.
+    'many.js': 'const j = "ES256";\n'.repeat(40),
+    'one.js': 'const k = crypto.createECDH("prime256v1");\n',
+  });
+  const r = run([`--path=${d}`, '--output=rp.json', '--report=rp.md']);
+  assert(r.code === 0, `exit ${r.code}`);
+  const md = fs.readFileSync(path.join(WORK, 'rp.md'), 'utf8');
+  const iHarvest = md.indexOf('already losing ground');
+  const iDeadline = md.indexOf('what the deadline governs');
+  assert(iHarvest > 0 && iDeadline > 0, 'the report has no urgency sections');
+  assert(iHarvest < iDeadline, 'the report ranks signatures above key agreement');
+  assert(/not a proof of absence/.test(md), 'the report omits its own limits');
+  assert(/not a compliance certification/.test(md), 'the report omits the certification limit');
+});
+
+check('the report states the coverage limits of the very scan that produced it', () => {
+  const d = fixture('rep2', { 'big.js': 'const k = crypto.createSign("RSA-SHA256");\n'.repeat(60000), 'ok.js': 'const x = "ECDSA";\n' });
+  run([`--path=${d}`, '--output=rp2.json', '--report=rp2.md']);
+  const md = fs.readFileSync(path.join(WORK, 'rp2.md'), 'utf8');
+  assert(/did not read everything/.test(md), 'a truncated scan produced a report that reads as complete');
+});
+
+// ─────────────────────── La urgencia viaja en el documento ───────────────────────
+check('urgency is recorded in the CBOM so nothing downstream has to infer it', () => {
+  const d = fixture('urg', { 'a.js': 'const s = crypto.createSign("RSA-SHA256");\nconst j = "ES256";\nconst k = "X25519";\n' });
+  run([`--path=${d}`, '--output=urg.json']);
+  const doc = cbom('urg.json');
+  const urgency = (name) => {
+    const c = doc.components.find((x) => x.name === name);
+    return (c.properties || []).find((p) => p.name === 'fractalai:urgency')?.value;
+  };
+  assert(urgency('ECDSA') === 'deadline', `ECDSA urgency ${urgency('ECDSA')}`);
+  assert(urgency('X25519 / X448') === 'harvest', `X25519 urgency ${urgency('X25519 / X448')}`);
+  // RSA es `harvest` aunque su primitive sea `pke`: un barrido estatico no puede distinguir
+  // transporte de claves de firma, y ante la duda se asume la lectura con exposicion retroactiva.
+  // Inferirlo del primitive daba mal justamente este caso.
+  assert(urgency('RSA') === 'harvest', `RSA urgency ${urgency('RSA')}; inferring it from the primitive gets this one wrong`);
+});
+
+// ─────────────────────── Salidas del paso para el workflow ───────────────────────
+check('the step publishes the ratchet and the truncation as usable outputs', () => {
+  const d = fixture('outs', { 'a.js': 'const s = crypto.createSign("RSA-SHA256");\n' });
+  const go = path.join(WORK, 'go-outs.txt');
+  fs.writeFileSync(go, '');
+  run([`--path=${d}`, '--output=o.json', '--sarif=o.sarif', '--baseline=blo.json', '--write-baseline=true'], { GITHUB_OUTPUT: go });
+  fs.writeFileSync(go, '');
+  run([`--path=${d}`, '--output=o.json', '--sarif=o.sarif', '--baseline=blo.json'], { GITHUB_OUTPUT: go });
+  const written = fs.readFileSync(go, 'utf8');
+  for (const key of ['findings=', 'increased=', 'decreased=', 'truncated=']) {
+    assert(written.includes(key), `output ${key} missing from: ${written}`);
+  }
+  assert(/sarif<<PQC_EOF_[0-9a-f]{32}/.test(written), 'the sarif path is not delimited');
 });
 
 // ───────────────────────────── Result ─────────────────────────────

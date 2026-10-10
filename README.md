@@ -31,6 +31,13 @@ push, for free.
 
 ## What it does
 
+- Puts the findings **in your repository's Security tab and inline on pull-request diffs**, by
+  emitting SARIF and uploading it to GitHub code scanning. Free on public repositories.
+- **Ratchets the inventory down.** Freeze today's counts as a baseline and the job fails only when
+  a family goes *up*. Nobody can fix hundreds of occurrences in an afternoon, but every team can
+  agree not to add more, so this is the gate you can switch on the first day.
+- Writes a **report a person can read** and hand to an auditor, ordered by real urgency rather than
+  by the biggest number.
 - Scans your manifests and source for known quantum-vulnerable primitives: RSA, ECDSA,
   ECDH/X25519, Ed25519/EdDSA, Diffie-Hellman, DSA.
 - Also reports what is **already quantum-resistant** (ML-DSA, ML-KEM, SLH-DSA, AES-256,
@@ -54,6 +61,82 @@ Stated plainly, because an inventory you can't trust is worse than none:
   occurrence count is the true total even when only the first 25 locations are listed.
 - **Not a secret collector.** It reads your files in your runner and uploads nothing.
   There is no account, no API key, and no telemetry. Read `scan.mjs` — it is one file.
+
+## Not every finding is equally urgent
+
+An inventory of 836 occurrences with no order is unusable, and inventing a severity score would be
+worse. There is one real cryptographic distinction and it is the only one this tool uses:
+
+**Harvest now, decrypt later.** Key agreement and key transport — ECDH, X25519, finite-field
+Diffie-Hellman, and RSA where it carries keys — protect traffic an adversary can **record today**
+and decrypt the day a quantum computer exists. Migrating in 2029 does not repair traffic captured
+in 2026. These do not wait for the deadline.
+
+**The deadline governs the rest.** A signature made today cannot be forged retroactively. ECDSA,
+EdDSA and DSA matter when you must keep signing and verifying after 2030, and earlier for anything
+whose validity must outlive it: firmware, trust roots, code signing, long-dated certificates.
+
+RSA is ranked with the first group even though it also signs. A static scan cannot tell key
+transport from signing, and where the two readings differ we take the one that implies retroactive
+exposure. That is stated here rather than hidden inside a score.
+
+## The ratchet: the gate you can actually switch on
+
+`fail-on-findings` is honest and unusable on day one. A real repository has hundreds of
+occurrences, nobody clears them in an afternoon, so the gate stays off forever and the tool becomes
+decorative.
+
+Freeze the current state instead, and fail only on regression:
+
+```yaml
+- uses: johnInarti/pqc-readiness-action@v1
+  with:
+    baseline: .github/pqc-baseline.json
+    write-baseline: true     # once, then commit the file and remove this line
+```
+
+```yaml
+- uses: johnInarti/pqc-readiness-action@v1
+  with:
+    baseline: .github/pqc-baseline.json
+    fail-on-increase: true   # from now on
+```
+
+The comparison is **per algorithm family, not per total**, on purpose: removing twenty signature
+sites and adding one key-agreement site lowers the total and raises your real exposure. A single
+number hides exactly the change that matters.
+
+Two deliberate refusals. Asking for `fail-on-increase` with no baseline **fails the job** instead
+of passing green, because a gate that silently protects nothing is worse than no gate. And
+`write-baseline` is never automatic: overwriting the file forgives every regression since it was
+written, so that has to be somebody's decision.
+
+## Findings where your team already looks
+
+```yaml
+jobs:
+  pqc:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write      # to upload to code scanning
+      pull-requests: write        # to comment on the PR
+    steps:
+      - uses: actions/checkout@v4
+      - uses: johnInarti/pqc-readiness-action@v1
+        with:
+          baseline: .github/pqc-baseline.json
+          fail-on-increase: true
+          comment-on-pr: true
+          report: PQC-REPORT.md
+```
+
+That puts the inventory in three places: the Security tab, a sticky comment on the pull request
+that is rewritten rather than duplicated on every push, and a committed Markdown report.
+
+**If you do not grant those permissions, nothing breaks.** The upload and the comment are skipped
+with a message naming the exact permission that was missing, and the scan still succeeds. A tool
+that fails someone else's build over a permission they did not know about deserves to be uninstalled.
 
 ## Usage
 
@@ -80,23 +163,35 @@ jobs:
 |---|---|---|
 | `path` | `.` | Directory to scan. |
 | `output` | `cbom.json` | Where to write the CycloneDX CBOM. |
-| `fail-on-findings` | `false` | Exit non-zero if anything vulnerable is found. Leave this off until you have a migration plan, or you will block every PR on day one. |
-| `seal` | `false` | Optional, paid. See below. |
+| `sarif` | `pqc.sarif` | Where to write the SARIF report. Empty string to skip. |
+| `upload-sarif` | `true` | Upload to GitHub code scanning. Needs `security-events: write`; skipped with an explanation if absent. |
+| `baseline` | — | Baseline file with the frozen count per family. Commit it. |
+| `write-baseline` | `false` | Write or overwrite the baseline from this run. Do it deliberately. |
+| `fail-on-increase` | `false` | Fail only when a family goes up against the baseline. Requires `baseline`. |
+| `report` | — | Where to write the human-readable Markdown report. |
+| `comment-on-pr` | `false` | Keep one comment updated on the pull request. Needs `pull-requests: write`. |
+| `fail-on-findings` | `false` | Fail if anything vulnerable is found at all. Honest but unusable on day one; prefer `fail-on-increase`. |
+| `seal` | `false` | Preview, not yet usable. See below. |
+| `token` | job token | Used only for the SARIF upload and the pull-request comment. |
 
 ### Outputs
 
 | Output | What it is |
 |---|---|
-| `findings` | Total number of vulnerable occurrences. |
+| `findings` | Total vulnerable occurrences found in code. |
 | `cbom` | Path to the CBOM file. |
+| `sarif` | Path to the SARIF file, empty if none was requested. |
+| `increased` | Families that went up against the baseline. `0` with no baseline. |
+| `decreased` | Families that went down. |
+| `truncated` | `true` when the scan could not read everything, so a clean result must not be read as clean. |
 
-### Gate a repository once you are ready
+### It never counts itself
 
-```yaml
-      - uses: johnInarti/pqc-readiness-action@v1
-        with:
-          fail-on-findings: true
-```
+A CBOM contains, by definition, the names of the algorithms it inventories. Reading one back would
+inflate every number with findings that are our own report — and that is not only a same-run
+artefact: anyone who commits their CBOM, which is exactly what we recommend, would poison every
+later scan. This action's own outputs are excluded by path, and any CycloneDX, SARIF or baseline
+document is excluded **by content**, under any filename. The exclusion is reported, not silent.
 
 ## Optional: a signed inventory — preview, not yet usable
 

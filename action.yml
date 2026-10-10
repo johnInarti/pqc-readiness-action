@@ -1,9 +1,10 @@
 name: 'PQC Readiness Scan (CBOM)'
-description: 'Find the quantum-vulnerable cryptography in your repo and emit a CycloneDX CBOM. NIST deprecates these algorithms after 2030 and disallows them after 2035.'
+description: 'Find the quantum-vulnerable cryptography in your repo, emit a CycloneDX CBOM, surface it in GitHub code scanning, and ratchet it down. NIST disallows these algorithms after 2035.'
 author: 'FRACTAL AI S.A.S.'
 branding:
   icon: 'shield'
   color: 'purple'
+
 inputs:
   path:
     description: 'Directory to scan.'
@@ -13,10 +14,57 @@ inputs:
     description: 'Where to write the CycloneDX CBOM. Must stay inside the workspace.'
     required: false
     default: 'cbom.json'
-  fail-on-findings:
-    description: 'Exit non-zero if quantum-vulnerable cryptography is found. Default false: this is an inventory, not a gate.'
+
+  sarif:
+    description: >-
+      Where to write a SARIF 2.1.0 report. This is what puts the findings in your repository's
+      Security tab and annotates them inline on pull-request diffs. Set to an empty string to skip.
+    required: false
+    default: 'pqc.sarif'
+  upload-sarif:
+    description: >-
+      Upload the SARIF to GitHub code scanning. Needs `permissions: security-events: write` on the
+      job. If that permission is missing the upload is skipped with an explanation and the scan
+      still succeeds: a missing permission must never fail someone else's build.
+    required: false
+    default: 'true'
+
+  baseline:
+    description: >-
+      Path to a baseline file holding the frozen occurrence count per algorithm family. Commit it,
+      and every later run reports the delta against it. This is what makes a years-long migration
+      measurable instead of a single intimidating number.
+    required: false
+    default: ''
+  write-baseline:
+    description: >-
+      Write (or overwrite) the baseline file from this run. Do it deliberately: overwriting forgives
+      every regression accumulated since the file was written.
     required: false
     default: 'false'
+  fail-on-increase:
+    description: >-
+      Fail the job only when an algorithm family goes UP against the baseline. This is the gate a
+      team can switch on the first day, because it asks nobody to fix the existing inventory, only
+      not to add to it. Requires `baseline`.
+    required: false
+    default: 'false'
+
+  fail-on-findings:
+    description: >-
+      Fail the job if any quantum-vulnerable cryptography is found at all. Honest but unusable on a
+      real repository on day one, where there are hundreds of occurrences; prefer fail-on-increase.
+    required: false
+    default: 'false'
+
+  comment-on-pr:
+    description: >-
+      On a pull request, post (and keep updating) one comment with what this PR changes about the
+      inventory. Needs `permissions: pull-requests: write`. Skipped with an explanation if the
+      permission is missing.
+    required: false
+    default: 'false'
+
   seal:
     description: >-
       PREVIEW, not yet usable from this Action. It would request an ML-DSA-65 (FIPS 204) signature
@@ -25,28 +73,119 @@ inputs:
       what would be sent. The scan and the CBOM are free and always run entirely in your runner.
     required: false
     default: 'false'
+
+  token:
+    description: 'Token used only for uploading SARIF and posting the pull-request comment. Defaults to the job token.'
+    required: false
+    default: ${{ github.token }}
+
 outputs:
   findings:
-    description: 'Total number of quantum-vulnerable occurrences found (occurrences, not distinct algorithms).'
+    description: 'Total number of quantum-vulnerable occurrences found in code (occurrences, not distinct algorithms).'
     value: ${{ steps.scan.outputs.findings }}
   cbom:
     description: 'Path to the generated CBOM.'
     value: ${{ steps.scan.outputs.cbom }}
+  sarif:
+    description: 'Path to the generated SARIF report, empty if none was requested.'
+    value: ${{ steps.scan.outputs.sarif }}
+  increased:
+    description: 'Number of algorithm families that went UP against the baseline. 0 when there is no baseline.'
+    value: ${{ steps.scan.outputs.increased }}
+  decreased:
+    description: 'Number of algorithm families that went DOWN against the baseline.'
+    value: ${{ steps.scan.outputs.decreased }}
+  truncated:
+    description: 'true when the scan could not read everything, so a clean result must not be read as clean.'
+    value: ${{ steps.scan.outputs.truncated }}
+
 runs:
   using: 'composite'
   steps:
-    # Every input reaches the scanner through the ENVIRONMENT, never interpolated into this
-    # shell script. That is not style: `run: node x --path="${{ inputs.path }}"` lets the
-    # runner paste the raw input text into the script BEFORE bash parses it, so any workflow
-    # that wires an input from a pull-request title, an issue body or a dispatch field hands
-    # command execution to whoever wrote that text, with the job's secrets in scope. Values
-    # passed via `env:` are never re-parsed by bash, so the same payload stays inert data.
+    # Every input reaches the scanner through the ENVIRONMENT, never interpolated into this shell
+    # script. That is not style: `run: node x --path="${{ inputs.path }}"` lets the runner paste the
+    # raw input text into the script BEFORE bash parses it, so any workflow that wires an input from
+    # a pull-request title, an issue body or a dispatch field hands command execution to whoever
+    # wrote that text, with the job's secrets in scope. Values passed via `env:` are never
+    # re-parsed by bash, so the same payload stays inert data.
     - id: scan
       shell: bash
       env:
         PQC_ACTION_PATH: ${{ github.action_path }}
         PQC_PATH: ${{ inputs.path }}
         PQC_OUTPUT: ${{ inputs.output }}
+        PQC_SARIF: ${{ inputs.sarif }}
+        PQC_BASELINE: ${{ inputs.baseline }}
+        PQC_WRITE_BASELINE: ${{ inputs.write-baseline }}
+        PQC_FAIL_ON_INCREASE: ${{ inputs.fail-on-increase }}
         PQC_FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
         PQC_SEAL: ${{ inputs.seal }}
       run: node "$PQC_ACTION_PATH/scan.mjs"
+
+    # Subida a code scanning por la API y no con github/codeql-action/upload-sarif, por una razón
+    # concreta: los pasos de una acción composite NO admiten `continue-on-error`, así que invocar
+    # ahí otra acción que falla sin `security-events: write` tumbaría el pase de quien nos adopte
+    # por una permiso que quizá ni sabe que existe. Haciéndolo con la API podemos degradar a un
+    # aviso exacto. Un vigilante al que le faltan permisos avisa; no rompe la obra de otro.
+    - name: Upload SARIF to code scanning
+      if: ${{ inputs.sarif != '' && inputs.upload-sarif == 'true' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        SARIF_FILE: ${{ steps.scan.outputs.sarif }}
+        REPO: ${{ github.repository }}
+        SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        REF: ${{ github.event.pull_request.head.ref && format('refs/heads/{0}', github.event.pull_request.head.ref) || github.ref }}
+      run: |
+        set -uo pipefail
+        if [ -z "${GH_TOKEN:-}" ]; then
+          echo "::notice title=PQC scan::no token available, skipping the code-scanning upload"; exit 0
+        fi
+        if [ ! -f "$SARIF_FILE" ]; then
+          echo "::notice title=PQC scan::no SARIF file was produced, nothing to upload"; exit 0
+        fi
+        PAYLOAD=$(gzip -c "$SARIF_FILE" | base64 | tr -d '\n')
+        BODY=$(SHA="$SHA" REF="$REF" PAYLOAD="$PAYLOAD" node -e '
+          process.stdout.write(JSON.stringify({
+            commit_sha: process.env.SHA,
+            ref: process.env.REF,
+            sarif: process.env.PAYLOAD,
+            tool_name: "PQC Readiness Scan",
+          }));
+        ')
+        CODE=$(printf "%s" "$BODY" | curl -sS -o /tmp/pqc-sarif-resp.json -w '%{http_code}' \
+          -X POST "https://api.github.com/repos/$REPO/code-scanning/sarifs" \
+          -H "Authorization: Bearer $GH_TOKEN" \
+          -H "Accept: application/vnd.github+json" \
+          -H "X-GitHub-Api-Version: 2022-11-28" \
+          --data-binary @- || echo 000)
+        case "$CODE" in
+          202)
+            echo "Uploaded to code scanning. The findings will appear in the Security tab and on pull-request diffs." ;;
+          403)
+            echo "::warning title=PQC scan: code-scanning upload skipped::The job is missing 'security-events: write'. Add it to your job's permissions block to see these findings in the Security tab and annotated on pull-request diffs. The scan itself succeeded and the CBOM was written." ;;
+          404)
+            echo "::warning title=PQC scan: code-scanning upload skipped::Code scanning is not available for this repository (it needs GitHub Advanced Security on private repositories; it is free on public ones). The scan itself succeeded and the CBOM was written." ;;
+          *)
+            echo "::warning title=PQC scan: code-scanning upload skipped::HTTP $CODE from the code-scanning API. The scan itself succeeded and the CBOM was written."
+            head -c 400 /tmp/pqc-sarif-resp.json || true ;;
+        esac
+        exit 0
+
+    # Un comentario FIJO que se reescribe, no uno nuevo por cada push: veinte comentarios idénticos
+    # en un pull request largo es la forma más rápida de que alguien desactive la herramienta.
+    - name: Comment the delta on the pull request
+      if: ${{ inputs.comment-on-pr == 'true' && github.event_name == 'pull_request' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        REPO: ${{ github.repository }}
+        PR: ${{ github.event.pull_request.number }}
+        FINDINGS: ${{ steps.scan.outputs.findings }}
+        INCREASED: ${{ steps.scan.outputs.increased }}
+        DECREASED: ${{ steps.scan.outputs.decreased }}
+        TRUNCATED: ${{ steps.scan.outputs.truncated }}
+        CBOM: ${{ steps.scan.outputs.cbom }}
+      run: |
+        node "${{ github.action_path }}/pr-comment.mjs" \
+          || echo "::warning title=PQC scan::the pull-request comment was skipped; see the log above. The scan itself succeeded."
