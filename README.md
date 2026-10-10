@@ -1,5 +1,8 @@
 # PQC Readiness Scan
 
+[![post-quantum](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/johnInarti/pqc-readiness-action/main/pqc-badge.json)](https://github.com/johnInarti/pqc-readiness-action/blob/main/PQC-REPORT.md)
+[![test](https://github.com/johnInarti/pqc-readiness-action/actions/workflows/test.yml/badge.svg)](https://github.com/johnInarti/pqc-readiness-action/actions/workflows/test.yml)
+
 **Find the quantum-vulnerable cryptography in your repository and get a CycloneDX CBOM.**
 One line in your workflow. Free. Runs entirely in your runner — nothing is uploaded.
 

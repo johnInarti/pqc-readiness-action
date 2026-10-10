@@ -1,0 +1,20 @@
+{
+  "tool": "pqc-readiness-scan",
+  "version": "1.2.0",
+  "created_at": "2026-10-10T17:56:31.887Z",
+  "note": "Frozen counts per algorithm family, for the ratchet. Regenerate deliberately: overwriting this file forgives every regression since it was written.",
+  "counts": {
+    "rsa": 20,
+    "ecdsa": 23,
+    "ecdh": 10,
+    "x25519": 8,
+    "dh": 9,
+    "dsa": 14,
+    "eddsa": 15,
+    "keymaterial": 5
+  },
+  "files_scanned": 11,
+  "coverage_limits": [
+    "these directory names were skipped by default and may contain cryptography: .git"
+  ]
+}

@@ -36,6 +36,7 @@ jobs:
           upload-sarif: 'true'
           report: PQC-REPORT.md
           badge: pqc-badge.json
+          baseline: .github/pqc-baseline.json
 
       - name: Guardar el inventario como artefacto
         uses: actions/upload-artifact@v4
@@ -57,9 +58,11 @@ jobs:
           set -uo pipefail
           git config user.name "pqc-self-scan"
           git config user.email "noreply@fractalai.net.co"
-          git add pqc-badge.json 2>/dev/null || true
-          git diff --cached --quiet && { echo "la insignia no cambió"; exit 0; }
-          git commit -q -m "self-scan: actualizar la insignia post-cuántica [skip ci]"
+          # También el informe: la insignia del README enlaza a él, y una insignia que apunta a un
+          # archivo que no existe es peor que no tener insignia.
+          git add pqc-badge.json PQC-REPORT.md 2>/dev/null || true
+          git diff --cached --quiet && { echo "la insignia y el informe no cambiaron"; exit 0; }
+          git commit -q -m "self-scan: actualizar la insignia y el informe post-cuántico [skip ci]"
           git push -q origin HEAD:main && echo "insignia actualizada" || echo "::warning::no se pudo empujar la insignia; el barrido sí se hizo"
 
       - name: Nuestro propio inventario, en el resumen del pase
